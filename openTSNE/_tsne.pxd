@@ -36,7 +36,7 @@ cpdef tuple estimate_positive_gradient_nn(
     bint should_eval_error=*,
 )
 
-cpdef double estimate_negative_gradient_bh(
+cpdef tuple estimate_negative_gradient_bh(
     QuadTree tree,
     double[:, ::1] embedding,
     double[:, ::1] gradient,

@@ -2,23 +2,34 @@ import inspect
 import logging
 import multiprocessing
 import warnings
+from dataclasses import dataclass
 from collections.abc import Iterable
-from types import SimpleNamespace
+from dataclasses import dataclass
 from time import time
+from types import SimpleNamespace
 
 import numpy as np
 from sklearn.base import BaseEstimator
 
-from openTSNE import _tsne
+from openTSNE import _tsne, utils
 from openTSNE import initialization as initialization_scheme
 from openTSNE.affinity import Affinities, MultiscaleMixture
 from openTSNE.quad_tree import QuadTree
-from openTSNE import utils
-
 
 EPSILON = np.finfo(np.float64).eps
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class OptimizationStats:
+    """Dataclass to store optimization statistics."""
+
+    iteration: list
+    KLs: list
+    alphas: list
+    alpha_gradients: list
+    embeddings: list
 
 
 def _check_callbacks(callbacks):
@@ -117,7 +128,8 @@ def __check_init_num_dimensions(num_dimensions, required_num_dimensions):
 
 
 init_checks = SimpleNamespace(
-    num_samples=__check_init_num_samples, num_dimensions=__check_init_num_dimensions,
+    num_samples=__check_init_num_samples,
+    num_dimensions=__check_init_num_dimensions,
 )
 
 
@@ -169,7 +181,7 @@ class PartialTSNEEmbedding(np.ndarray):
         the appropriate learning rate is selected according to N / exaggeration
         as determined in Belkina et al. (2019), Nature Communications. Note that
         this will result in a different learning rate during the early
-        exaggeration phase and afterwards. This should *not* be used when 
+        exaggeration phase and afterwards. This should *not* be used when
         adding samples into existing embeddings, where the learning rate often
         needs to be much lower to obtain convergence.
 
@@ -249,7 +261,9 @@ class PartialTSNEEmbedding(np.ndarray):
     ):
         init_checks.num_samples(embedding.shape[0], P.shape[0])
 
-        obj = np.array(embedding, dtype=np.float64, order="C").view(PartialTSNEEmbedding)
+        obj = np.array(embedding, dtype=np.float64, order="C").view(
+            PartialTSNEEmbedding
+        )
 
         obj.reference_embedding = reference_embedding
         obj.P = P
@@ -384,7 +398,7 @@ class PartialTSNEEmbedding(np.ndarray):
         try:
             # Run gradient descent with the embedding optimizer so gains are
             # properly updated and kept
-            error, embedding = embedding.optimizer(
+            error, embedding, alpha_grad, optimization_stats = embedding.optimizer(
                 embedding=embedding,
                 reference_embedding=self.reference_embedding,
                 P=self.P,
@@ -422,7 +436,7 @@ class TSNEEmbedding(np.ndarray):
         the appropriate learning rate is selected according to N / exaggeration
         as determined in Belkina et al. (2019), Nature Communications. Note that
         this will result in a different learning rate during the early
-        exaggeration phase and afterwards. This should *not* be used when 
+        exaggeration phase and afterwards. This should *not* be used when
         adding samples into existing embeddings, where the learning rate often
         needs to be much lower to obtain convergence.
 
@@ -518,13 +532,15 @@ class TSNEEmbedding(np.ndarray):
 
         obj.affinities = affinities  # type: Affinities
         obj.gradient_descent_params = gradient_descent_params  # type: dict
-        obj.gradient_descent_params.update({
-            "negative_gradient_method": negative_gradient_method,
-            "n_interpolation_points": n_interpolation_points,
-            "min_num_intervals": min_num_intervals,
-            "ints_in_interval": ints_in_interval,
-            "dof": dof,
-        })
+        obj.gradient_descent_params.update(
+            {
+                "negative_gradient_method": negative_gradient_method,
+                "n_interpolation_points": n_interpolation_points,
+                "min_num_intervals": min_num_intervals,
+                "ints_in_interval": ints_in_interval,
+                "dof": dof,
+            }
+        )
         obj.random_state = random_state
 
         if optimizer is None:
@@ -542,7 +558,7 @@ class TSNEEmbedding(np.ndarray):
         obj.interp_coeffs = None
         obj.box_x_lower_bounds = None
         obj.box_y_lower_bounds = None
-
+        obj.optimization_stats = None
         return obj
 
     def optimize(
@@ -680,7 +696,7 @@ class TSNEEmbedding(np.ndarray):
         try:
             # Run gradient descent with the embedding optimizer so gains are
             # properly updated and kept
-            error, embedding = embedding.optimizer(
+            error, embedding, alpha_grad, optimization_stats = embedding.optimizer(
                 embedding=embedding, P=self.affinities.P, **optim_params
             )
 
@@ -691,6 +707,7 @@ class TSNEEmbedding(np.ndarray):
             error, embedding = ex.error, ex.final_embedding
 
         embedding.kl_divergence = error
+        embedding.optimization_stats = optimization_stats
 
         return embedding
 
@@ -743,7 +760,7 @@ class TSNEEmbedding(np.ndarray):
             initial point positions.
 
         learning_rate: Union[str, float]
-            The learning rate for t-SNE optimization. When 
+            The learning rate for t-SNE optimization. When
             ``learning_rate="auto"`` the appropriate learning rate is selected
             according to N / exaggeration as determined in Belkina et al.
             (2019), Nature Communications. Note that this will result in a
@@ -875,17 +892,16 @@ class TSNEEmbedding(np.ndarray):
             optimization.
 
         """
-
         # To maintain perfect backwards compatibility and to handle the very
         # specific case when the user wants to pass in `perplexity` to the
         # multiscale affinity object (multiscale accepts `perplexities`), rename
         # this parameter so everything works
         affinity_signature = inspect.signature(self.affinities.to_new)
         if (
-            "perplexities" in affinity_signature.parameters and
-            "perplexities" in affinity_signature.parameters and
-            "perplexity" in affinity_params and
-            "perplexities" not in affinity_params
+            "perplexities" in affinity_signature.parameters
+            and "perplexities" in affinity_signature.parameters
+            and "perplexity" in affinity_params
+            and "perplexities" not in affinity_params
         ):
             affinity_params["perplexities"] = affinity_params.pop("perplexity")
 
@@ -914,7 +930,10 @@ class TSNEEmbedding(np.ndarray):
             raise ValueError(f"Unrecognized initialization scheme `{initialization}`.")
 
         return PartialTSNEEmbedding(
-            embedding, self, P=P, **self.gradient_descent_params,
+            embedding,
+            self,
+            P=P,
+            **self.gradient_descent_params,
         )
 
     def prepare_interpolation_grid(self, padding=0.25):
@@ -951,7 +970,9 @@ class TSNEEmbedding(np.ndarray):
         if len(result) == 2:  # 1d case
             self.interp_coeffs, self.box_x_lower_bounds = result
         elif len(result) == 3:  # 2d case
-            self.interp_coeffs, self.box_x_lower_bounds, self.box_y_lower_bounds = result
+            self.interp_coeffs, self.box_x_lower_bounds, self.box_y_lower_bounds = (
+                result
+            )
         else:
             raise RuntimeError(
                 "Prepare interpolation grid function returned >3 values!"
@@ -1010,7 +1031,7 @@ class TSNE(BaseEstimator):
         the appropriate learning rate is selected according to N / exaggeration
         as determined in Belkina et al. (2019), Nature Communications. Note that
         this will result in a different learning rate during the early
-        exaggeration phase and afterwards. This should *not* be used when 
+        exaggeration phase and afterwards. This should *not* be used when
         adding samples into existing embeddings, where the learning rate often
         needs to be much lower to obtain convergence.
 
@@ -1148,6 +1169,8 @@ class TSNE(BaseEstimator):
         n_iter=500,
         exaggeration=None,
         dof=1,
+        initial_dof=1,
+        dof_learning_rate=0.5,
         theta=0.5,
         n_interpolation_points=3,
         min_num_intervals=50,
@@ -1182,6 +1205,8 @@ class TSNE(BaseEstimator):
         self.n_iter = n_iter
         self.exaggeration = exaggeration
         self.dof = dof
+        self.initial_dof = initial_dof
+        self.dof_learning_rate = dof_learning_rate
         self.theta = theta
         self.n_interpolation_points = n_interpolation_points
         self.min_num_intervals = min_num_intervals
@@ -1264,6 +1289,7 @@ class TSNE(BaseEstimator):
                 n_iter=self.early_exaggeration_iter,
                 exaggeration=self.early_exaggeration,
                 momentum=self.initial_momentum,
+                dof=self.initial_dof,
                 inplace=True,
                 propagate_exception=True,
             )
@@ -1323,7 +1349,6 @@ class TSNE(BaseEstimator):
             optimization.
 
         """
-
         # Either `X` or `affinities` must be specified
         if X is None and affinities is None and initialization is None:
             raise ValueError(
@@ -1373,7 +1398,11 @@ class TSNE(BaseEstimator):
             initialization = "spectral"
 
         # Same spiel for precomputed distance matrices
-        if self.metric == "precomputed" and isinstance(initialization, str) and initialization == "pca":
+        if (
+            self.metric == "precomputed"
+            and isinstance(initialization, str)
+            and initialization == "pca"
+        ):
             log.warning(
                 "Attempting to use `pca` initalization, but using precomputed "
                 "distance matrix! Using `spectral` initilization instead, which "
@@ -1423,9 +1452,7 @@ class TSNE(BaseEstimator):
                 verbose=self.verbose,
             )
         else:
-            raise ValueError(
-                f"Unrecognized initialization scheme `{initialization}`."
-            )
+            raise ValueError(f"Unrecognized initialization scheme `{initialization}`.")
 
         gradient_descent_params = {
             "dof": self.dof,
@@ -1446,6 +1473,7 @@ class TSNE(BaseEstimator):
             # Callback params
             "callbacks": self.callbacks,
             "callbacks_every_iters": self.callbacks_every_iters,
+            "initial_dof": self.initial_dof,
         }
 
         return TSNEEmbedding(
@@ -1491,7 +1519,7 @@ def kl_divergence_bh(
 
     # Compute negative gradient
     tree = QuadTree(reference_embedding)
-    sum_Q = _tsne.estimate_negative_gradient_bh(
+    sum_Q, alpha_grad_neg = _tsne.estimate_negative_gradient_bh(
         tree,
         embedding,
         gradient,
@@ -1503,14 +1531,14 @@ def kl_divergence_bh(
     del tree
 
     # Compute positive gradient
-    sum_P, kl_divergence_ = _tsne.estimate_positive_gradient_nn(
+    sum_P, kl_divergence_, alpha_grad_pos = _tsne.estimate_positive_gradient_nn(
         P.indices,
         P.indptr,
         P.data,
         embedding,
         reference_embedding,
         gradient,
-        dof,
+        dof=dof,
         num_threads=n_jobs,
         should_eval_error=should_eval_error,
     )
@@ -1520,7 +1548,9 @@ def kl_divergence_bh(
     if should_eval_error:
         kl_divergence_ += sum_P * np.log(sum_Q + EPSILON)
 
-    return kl_divergence_, gradient
+    alpha_grad = alpha_grad_pos - alpha_grad_neg
+
+    return kl_divergence_, gradient, alpha_grad
 
 
 def kl_divergence_fft(
@@ -1577,7 +1607,7 @@ def kl_divergence_fft(
         reference_embedding = embedding
 
     # Compute positive gradient
-    sum_P, kl_divergence_ = _tsne.estimate_positive_gradient_nn(
+    sum_P, kl_divergence_, alpha_grad_pos = _tsne.estimate_positive_gradient_nn(
         P.indices,
         P.indptr,
         P.data,
@@ -1599,6 +1629,8 @@ class gradient_descent:
     def __init__(self):
         self.gains = None
         self.update = None
+        self.dof_update = 0.0
+        self.dof_gain = 1.0
 
     def copy(self):
         optimizer = self.__class__()
@@ -1618,6 +1650,7 @@ class gradient_descent:
         momentum=0.8,
         exaggeration=None,
         dof=1,
+        initial_dof=1,
         min_gain=0.01,
         max_grad_norm=None,
         max_step_norm=5,
@@ -1630,6 +1663,7 @@ class gradient_descent:
         use_callbacks=False,
         callbacks=None,
         callbacks_every_iters=50,
+        eval_error_every_iter=50,
         verbose=False,
     ):
         """Perform batch gradient descent with momentum and gains.
@@ -1669,6 +1703,10 @@ class gradient_descent:
 
         dof: float
             Degrees of freedom of the Student's t-distribution.
+
+        optimize_for_alpha: bool
+            If True, perform the optimization for the alpha via gradient descent.
+            **Implemented only for the Barnes-Hut objective function.**
 
         min_gain: float
             Minimum individual gain for each parameter.
@@ -1728,6 +1766,8 @@ class gradient_descent:
         callbacks_every_iters: int
             How many iterations should pass between each time the callbacks are
             invoked.
+        eval_error_every_iter: int
+            How often should the error be evaluated, by default 50
 
         Returns
         -------
@@ -1755,9 +1795,9 @@ class gradient_descent:
 
         # If the interpolation grid has not yet been evaluated, do it now
         if (
-            reference_embedding is not None and
-            reference_embedding.interp_coeffs is None and
-            objective_function is kl_divergence_fft
+            reference_embedding is not None
+            and reference_embedding.interp_coeffs is None
+            and objective_function is kl_divergence_fft
         ):
             reference_embedding.prepare_interpolation_grid()
 
@@ -1796,32 +1836,47 @@ class gradient_descent:
                 getattr(callback, "optimization_about_to_start", lambda: ...)()
 
         timer = utils.Timer(
-            "Running optimization with exaggeration=%.2f, lr=%.2f for %d iterations..." % (
-                exaggeration, learning_rate, n_iter
-            ),
+            "Running optimization with exaggeration=%.2f, lr=%.2f for %d iterations..."
+            % (exaggeration, learning_rate, n_iter),
             verbose=verbose,
         )
         timer.__enter__()
 
         if verbose:
             start_time = time()
+        optimization_stats = OptimizationStats(
+            iteration=[],
+            alphas=[],
+            alpha_gradients=[],
+            KLs=[],
+            embeddings=[],
+        )
+
+        dof_ = initial_dof if dof == "auto" else dof
 
         for iteration in range(n_iter):
-            should_call_callback = use_callbacks and (iteration + 1) % callbacks_every_iters == 0
-            # Evaluate error on 50 iterations for logging, or when callbacks
-            should_eval_error = should_call_callback or \
-                (verbose and (iteration + 1) % 50 == 0)
+            should_call_callback = (
+                use_callbacks and (iteration + 1) % callbacks_every_iters == 0
+            )
 
-            error, gradient = objective_function(
+            should_eval_error = should_call_callback or (
+                verbose and (iteration + 1) % eval_error_every_iter == 0
+            )
+
+            error, gradient, alpha_grad = objective_function(
                 embedding,
                 P,
-                dof=dof,
+                dof=dof_,
                 bh_params=bh_params,
                 fft_params=fft_params,
                 reference_embedding=reference_embedding,
                 n_jobs=n_jobs,
                 should_eval_error=should_eval_error,
             )
+            optimization_stats.iteration.append(iteration)
+            optimization_stats.alphas.append(dof_)
+            optimization_stats.KLs.append(error)
+            optimization_stats.embeddings.append(embedding)
 
             # Clip gradients to avoid points shooting off. This can be an issue
             # when applying transform and points are initialized so that the new
@@ -1847,6 +1902,38 @@ class gradient_descent:
                     if exaggeration != 1:
                         P /= exaggeration
                     raise OptimizationInterrupt(error=error, final_embedding=embedding)
+
+            # === DOF UPDATE ===
+
+            if dof == "auto":
+                # === DoF UPDATE WITH DELTA-BAR-DELTA ===
+                # Delta-bar-delta: check if gradient direction changed
+                dof_grad_direction_flipped = np.sign(self.dof_update) != np.sign(
+                    alpha_grad
+                )
+
+                if dof_grad_direction_flipped:
+                    self.dof_gain += 0.2
+                else:
+                    self.dof_gain = self.dof_gain * 0.8 + min_gain
+
+                # Normalize learning rate by n_samples to get appropriate scale for DoF
+                n_samples = embedding.shape[0]
+
+                dof_lr = (
+                    learning_rate / n_samples
+                )  # <<<< This is just 1 with default settings
+
+                # Update DoF with momentum and adaptive gain
+                self.dof_update = (
+                    momentum * self.dof_update - dof_lr * self.dof_gain * alpha_grad
+                )
+                dof_ += self.dof_update
+
+                optimization_stats.alpha_gradients.append(self.dof_update)
+            else:
+                optimization_stats.alpha_gradients.append(0)
+            # === END DOF UPDATE ===
 
             # Update the embedding using the gradient
             grad_direction_flipped = np.sign(self.update) != np.sign(gradient)
@@ -1879,15 +1966,25 @@ class gradient_descent:
                     np.clip(embedding, lower_limit, upper_limit, out=embedding)
                 elif embedding.shape[1] == 2:
                     r_limit = max(abs(lower_limit), abs(upper_limit))
-                    embedding, mask = utils.clip_point_to_disc(embedding, r_limit, inplace=True)
+                    embedding, mask = utils.clip_point_to_disc(
+                        embedding, r_limit, inplace=True
+                    )
 
                 # Zero out the momentum terms for the points that hit the boundary
                 self.gains[mask] = 0
 
             if verbose and (iteration + 1) % 50 == 0:
                 stop_time = time()
-                print("Iteration %4d, KL divergence %6.4f, 50 iterations in %.4f sec" % (
-                    iteration + 1, error, stop_time - start_time))
+                print(
+                    "Iteration %4d, KL divergence %6.4f, DoF %6.4f, DoF gradient %6.4f, 50 iterations in %.4f sec"
+                    % (
+                        iteration + 1,
+                        error,
+                        dof_,
+                        self.dof_update,
+                        stop_time - start_time,
+                    )
+                )
                 start_time = time()
 
         timer.__exit__()
@@ -1899,10 +1996,10 @@ class gradient_descent:
         # The error from the loop is the one for the previous, non-updated
         # embedding. We need to return the error for the actual final embedding, so
         # compute that at the end before returning
-        error, _ = objective_function(
+        error, _, alpha_grad = objective_function(
             embedding,
             P,
-            dof=dof,
+            dof=dof_,
             bh_params=bh_params,
             fft_params=fft_params,
             reference_embedding=reference_embedding,
@@ -1910,4 +2007,4 @@ class gradient_descent:
             should_eval_error=True,
         )
 
-        return error, embedding
+        return error, embedding, alpha_grad, optimization_stats
