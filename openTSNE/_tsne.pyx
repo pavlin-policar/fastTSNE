@@ -112,14 +112,15 @@ cpdef tuple estimate_positive_gradient_nn(
     double dof=1,
     Py_ssize_t num_threads=1,
     bint should_eval_error=False,
+    bint compute_dof_grad=False,
 ):
     cdef:
         Py_ssize_t n_samples = gradient.shape[0]
-        Py_ssize_t n_dims = gradient.shape[1] 
+        Py_ssize_t n_dims = gradient.shape[1]
         double * diff
         double d_ij, p_ij, q_ij, kl_divergence = 0, sum_P = 0
-        double alpha_grad_pos = 0.0  # Initialize the positive alpha gradient term
-        double s, log_s, frac       # Variables for alpha gradient calculation
+        double alpha_grad_pos = 0.0
+        double log_s, frac
 
         Py_ssize_t i, j, k, d
 
@@ -160,12 +161,12 @@ cpdef tuple estimate_positive_gradient_nn(
                 for d in range(n_dims):
                     gradient[i, d] = gradient[i, d] + q_ij * p_ij * diff[d]
 
-                # Compute the alpha gradient positive term
-                s = 1.0 + d_ij / dof
-                log_s = log(s)
-                frac = d_ij / (dof + d_ij)
-                alpha_grad_pos += p_ij * (log_s - frac)
-
+                # Compute the alpha gradient positive term (only when needed
+                # for dof learning — this adds a log + divide per edge).
+                if compute_dof_grad:
+                    log_s = log(1.0 + d_ij / dof)
+                    frac = d_ij / (dof + d_ij)
+                    alpha_grad_pos += p_ij * (log_s - frac)
 
                 # Evaluating the following expressions can slow things down
                 # considerably if evaluated every iteration. Note that the q_ij
@@ -191,6 +192,7 @@ cpdef tuple estimate_negative_gradient_bh(
     double dof=1,
     Py_ssize_t num_threads=1,
     bint pairwise_normalization=True,
+    bint compute_dof_grad=False,
 ):
     """Estimate the negative t-SNE gradient using the Barnes-Hut approximation.
 
@@ -199,8 +201,9 @@ cpdef tuple estimate_negative_gradient_bh(
     sum_Q : double
         The sum of all q_{ij} values.
     alpha_grad_neg : double
-        The negative term of the gradient with respect to alpha.
-    
+        The negative term of the gradient with respect to alpha. Zero unless
+        ``compute_dof_grad`` is set.
+
     Notes
     -----
     Changes the gradient inplace to avoid needless memory allocation. As
@@ -220,8 +223,7 @@ cpdef tuple estimate_negative_gradient_bh(
 
     # In order to run gradient estimation in parallel, we need to pass each
     # worker its own memory slot to write sum_Qs
-    # Also estimate the negative part of the alpha-gradient   
-    for i in prange(num_points,nogil=True, num_threads=num_threads, schedule="guided"):
+    for i in prange(num_points, nogil=True, num_threads=num_threads, schedule="guided"):
         _estimate_negative_gradient_single(
             &tree.root,
             &embedding[i, 0],
@@ -230,13 +232,15 @@ cpdef tuple estimate_negative_gradient_bh(
             theta,
             dof,
             &alpha_grad_neg_i[i],
-            embedding.shape[1]
+            embedding.shape[1],
+            compute_dof_grad,
         )
 
-    # Aggregate sum_Q and alpha_grad_neg from all points
+    # Aggregate sum_Q (and alpha_grad_neg, when requested) from all points
     for i in range(num_points):
         sum_Q += sum_Qi[i]
-        alpha_grad_neg += alpha_grad_neg_i[i]
+        if compute_dof_grad:
+            alpha_grad_neg += alpha_grad_neg_i[i]
 
     # Normalize q_{ij}s
     for i in range(gradient.shape[0]):
@@ -246,7 +250,8 @@ cpdef tuple estimate_negative_gradient_bh(
             else:
                 gradient[i, j] /= sum_Qi[i] + EPSILON
 
-    alpha_grad_neg /= sum_Q # Normalize alpha_grad_neg
+    if compute_dof_grad:
+        alpha_grad_neg /= sum_Q
     return sum_Q, alpha_grad_neg
 
 
@@ -258,17 +263,18 @@ cdef void _estimate_negative_gradient_single(
     double theta,
     double dof,
     double *alpha_grad_neg,
-    Py_ssize_t n_dims
+    Py_ssize_t n_dims,
+    bint compute_dof_grad,
 ) noexcept nogil:
     cdef:
         double distance = EPSILON
         double q_ij, qij_term, tmp
-        double grad_coeff  # Declare grad_coeff
-        double s, log_s, frac
-        Py_ssize_t d, i
+        double grad_coeff
+        double log_s, frac
+        Py_ssize_t d
 
     # Compute the squared euclidean distance in the embedding space from the
-    # new point to the center of mass    
+    # new point to the center of mass
     for d in range(node.n_dims):
         tmp = node.center_of_mass[d] - point[d]
         distance += tmp * tmp
@@ -280,11 +286,11 @@ cdef void _estimate_negative_gradient_single(
     # Check if the node can be used as a summary (Barnes-Hut criterion)
     if node.is_leaf or node.length / sqrt(distance) < theta:
         if dof != 1:
-            q_ij = 1 / pow(1.0 + distance/dof, dof)
+            q_ij = 1 / pow(1.0 + distance / dof, dof)
         else:
             q_ij = 1 / (1 + distance)
-        
-        qij_term = q_ij*node.num_points  # q_ij * number of points in the node
+
+        qij_term = q_ij * node.num_points
 
         sum_Q[0] += qij_term
 
@@ -296,13 +302,13 @@ cdef void _estimate_negative_gradient_single(
 
         for d in range(n_dims):
             gradient[d] -= grad_coeff * (point[d] - node.center_of_mass[d])
-        
-        
-        # Compute the negative alpha gradient contribution
-        s = 1.0 + (distance / dof)
-        log_s = log(s)
-        frac = distance / (dof + distance)
-        alpha_grad_neg[0] += qij_term * (log_s - frac)
+
+        # Compute the negative alpha gradient contribution (only when needed
+        # for dof learning — this adds a log + divide per visited node).
+        if compute_dof_grad:
+            log_s = log(1.0 + distance / dof)
+            frac = distance / (dof + distance)
+            alpha_grad_neg[0] += qij_term * (log_s - frac)
 
         return
 
@@ -316,7 +322,8 @@ cdef void _estimate_negative_gradient_single(
             theta,
             dof,
             alpha_grad_neg,
-            n_dims
+            n_dims,
+            compute_dof_grad,
         )
 
 

@@ -19,7 +19,8 @@ from openTSNE import initialization
 from openTSNE.affinity import PerplexityBasedNN
 from openTSNE.nearest_neighbors import NNDescent
 from openTSNE.tsne import (
-    kl_divergence_bh, kl_divergence_fft, TSNEEmbedding, PartialTSNEEmbedding
+    kl_divergence_bh, kl_divergence_fft, TSNEEmbedding, PartialTSNEEmbedding,
+    GradientResult,
 )
 from openTSNE.utils import is_package_installed
 
@@ -740,6 +741,19 @@ def get_mismatching_default_values(f1, f2, mapping=None):
             mismatch.append((f1_param_name, val1, f2_param_name, val2))
 
     return mismatch
+
+
+class TestGradientResult(unittest.TestCase):
+    def test_required_fields(self):
+        g = np.zeros((4, 2))
+        r = GradientResult(error=1.5, gradient=g)
+        self.assertEqual(r.error, 1.5)
+        self.assertIs(r.gradient, g)
+        self.assertEqual(r.dof_grad, 0.0)
+
+    def test_dof_grad_can_be_set(self):
+        r = GradientResult(error=0.0, gradient=np.zeros((2, 2)), dof_grad=-0.7)
+        self.assertEqual(r.dof_grad, -0.7)
 
 
 class TestGradientDescentOptimizer(unittest.TestCase):

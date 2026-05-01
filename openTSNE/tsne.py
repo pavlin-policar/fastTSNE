@@ -2,9 +2,8 @@ import inspect
 import logging
 import multiprocessing
 import warnings
-from dataclasses import dataclass
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import time
 from types import SimpleNamespace
 
@@ -22,14 +21,23 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class GradientResult:
+    """Result of a single objective-function evaluation."""
+
+    error: float
+    gradient: np.ndarray
+    dof_grad: float = 0.0
+
+
+@dataclass
 class OptimizationStats:
     """Dataclass to store optimization statistics."""
 
-    iteration: list
-    KLs: list
-    alphas: list
-    alpha_gradients: list
-    embeddings: list
+    iteration: list = field(default_factory=list)
+    KLs: list = field(default_factory=list)
+    alphas: list = field(default_factory=list)
+    alpha_gradients: list = field(default_factory=list)
+    embeddings: list = field(default_factory=list)
 
 
 def _check_callbacks(callbacks):
@@ -398,7 +406,7 @@ class PartialTSNEEmbedding(np.ndarray):
         try:
             # Run gradient descent with the embedding optimizer so gains are
             # properly updated and kept
-            error, embedding, alpha_grad, optimization_stats = embedding.optimizer(
+            error, embedding, optimization_stats = embedding.optimizer(
                 embedding=embedding,
                 reference_embedding=self.reference_embedding,
                 P=self.P,
@@ -696,7 +704,7 @@ class TSNEEmbedding(np.ndarray):
         try:
             # Run gradient descent with the embedding optimizer so gains are
             # properly updated and kept
-            error, embedding, alpha_grad, optimization_stats = embedding.optimizer(
+            error, embedding, optimization_stats = embedding.optimizer(
                 embedding=embedding, P=self.affinities.P, **optim_params
             )
 
@@ -1492,6 +1500,7 @@ def kl_divergence_bh(
     reference_embedding=None,
     should_eval_error=False,
     n_jobs=1,
+    compute_dof_grad=False,
     **_,
 ):
     if embedding.ndim != 1 and embedding.shape[1] > 3:
@@ -1527,6 +1536,7 @@ def kl_divergence_bh(
         dof=dof,
         num_threads=n_jobs,
         pairwise_normalization=pairwise_normalization,
+        compute_dof_grad=compute_dof_grad,
     )
     del tree
 
@@ -1541,6 +1551,7 @@ def kl_divergence_bh(
         dof=dof,
         num_threads=n_jobs,
         should_eval_error=should_eval_error,
+        compute_dof_grad=compute_dof_grad,
     )
 
     # Computing positive gradients summed up only unnormalized q_ijs, so we
@@ -1548,9 +1559,12 @@ def kl_divergence_bh(
     if should_eval_error:
         kl_divergence_ += sum_P * np.log(sum_Q + EPSILON)
 
-    alpha_grad = alpha_grad_pos - alpha_grad_neg
-
-    return kl_divergence_, gradient, alpha_grad
+    dof_grad = alpha_grad_pos - alpha_grad_neg if compute_dof_grad else 0.0
+    return GradientResult(
+        error=kl_divergence_,
+        gradient=gradient,
+        dof_grad=dof_grad,
+    )
 
 
 def kl_divergence_fft(
@@ -1607,7 +1621,7 @@ def kl_divergence_fft(
         reference_embedding = embedding
 
     # Compute positive gradient
-    sum_P, kl_divergence_, alpha_grad_pos = _tsne.estimate_positive_gradient_nn(
+    sum_P, kl_divergence_, _alpha_grad_pos = _tsne.estimate_positive_gradient_nn(
         P.indices,
         P.indptr,
         P.data,
@@ -1622,7 +1636,10 @@ def kl_divergence_fft(
     if should_eval_error:
         kl_divergence_ += sum_P * np.log(sum_Q + EPSILON)
 
-    return kl_divergence_, gradient
+    # The FFT negative-gradient kernels do not compute the dof-gradient term,
+    # so we cannot return a meaningful value here. Learning dof requires the
+    # Barnes-Hut objective; see the guard in `gradient_descent.__call__`.
+    return GradientResult(error=kl_divergence_, gradient=gradient, dof_grad=0.0)
 
 
 class gradient_descent:
@@ -1852,7 +1869,18 @@ class gradient_descent:
             embeddings=[],
         )
 
+        if dof == "auto" and objective_function is kl_divergence_fft:
+            log.warning(
+                "Learning the degrees of freedom (`dof='auto'`) is only "
+                "implemented for the Barnes-Hut objective. The FFT objective "
+                "does not compute the dof gradient, so dof will remain fixed "
+                "at `initial_dof=%s`. Set `negative_gradient_method='bh'` to "
+                "actually learn dof.",
+                initial_dof,
+            )
+
         dof_ = initial_dof if dof == "auto" else dof
+        compute_dof_grad = dof == "auto"
 
         for iteration in range(n_iter):
             should_call_callback = (
@@ -1863,7 +1891,7 @@ class gradient_descent:
                 verbose and (iteration + 1) % eval_error_every_iter == 0
             )
 
-            error, gradient, alpha_grad = objective_function(
+            result = objective_function(
                 embedding,
                 P,
                 dof=dof_,
@@ -1872,7 +1900,12 @@ class gradient_descent:
                 reference_embedding=reference_embedding,
                 n_jobs=n_jobs,
                 should_eval_error=should_eval_error,
+                compute_dof_grad=compute_dof_grad,
             )
+            error = result.error
+            gradient = result.gradient
+            dof_grad = result.dof_grad
+
             optimization_stats.iteration.append(iteration)
             optimization_stats.alphas.append(dof_)
             optimization_stats.KLs.append(error)
@@ -1909,7 +1942,7 @@ class gradient_descent:
                 # === DoF UPDATE WITH DELTA-BAR-DELTA ===
                 # Delta-bar-delta: check if gradient direction changed
                 dof_grad_direction_flipped = np.sign(self.dof_update) != np.sign(
-                    alpha_grad
+                    dof_grad
                 )
 
                 if dof_grad_direction_flipped:
@@ -1926,7 +1959,7 @@ class gradient_descent:
 
                 # Update DoF with momentum and adaptive gain
                 self.dof_update = (
-                    momentum * self.dof_update - dof_lr * self.dof_gain * alpha_grad
+                    momentum * self.dof_update - dof_lr * self.dof_gain * dof_grad
                 )
                 dof_ += self.dof_update
 
@@ -1996,7 +2029,7 @@ class gradient_descent:
         # The error from the loop is the one for the previous, non-updated
         # embedding. We need to return the error for the actual final embedding, so
         # compute that at the end before returning
-        error, _, alpha_grad = objective_function(
+        result = objective_function(
             embedding,
             P,
             dof=dof_,
@@ -2005,6 +2038,7 @@ class gradient_descent:
             reference_embedding=reference_embedding,
             n_jobs=n_jobs,
             should_eval_error=True,
+            compute_dof_grad=False,
         )
 
-        return error, embedding, alpha_grad, optimization_stats
+        return result.error, embedding, optimization_stats
