@@ -1257,7 +1257,7 @@ class TSNE(BaseEstimator):
         n_iter=500,
         exaggeration=None,
         dof=1,
-        initial_dof=1,
+        initial_dof=None,
         dof_learning_rate=0.5,
         theta=0.5,
         n_interpolation_points=3,
@@ -1377,7 +1377,6 @@ class TSNE(BaseEstimator):
                 n_iter=self.early_exaggeration_iter,
                 exaggeration=self.early_exaggeration,
                 momentum=self.initial_momentum,
-                dof=self.initial_dof,
                 inplace=True,
                 propagate_exception=True,
             )
@@ -1747,7 +1746,7 @@ class gradient_descent:
         momentum=0.8,
         exaggeration=None,
         dof=1,
-        initial_dof=1,
+        initial_dof=None,
         min_gain=0.01,
         max_grad_norm=None,
         max_step_norm=5,
@@ -1948,6 +1947,20 @@ class gradient_descent:
         if verbose:
             start_time = time()
 
+        if dof == "auto":
+            dof_ = 1.0 if initial_dof is None else initial_dof
+            compute_dof_grad = True
+        else:
+            if initial_dof is not None:
+                warnings.warn(
+                    "`initial_dof=%s` is ignored because `dof=%s` is fixed; "
+                    "`initial_dof` only applies when `dof='auto'`."
+                    % (initial_dof, dof),
+                    stacklevel=2,
+                )
+            dof_ = dof
+            compute_dof_grad = False
+
         if dof == "auto" and objective_function is kl_divergence_fft:
             log.warning(
                 "Learning the degrees of freedom (`dof='auto'`) is only "
@@ -1955,11 +1968,8 @@ class gradient_descent:
                 "does not compute the dof gradient, so dof will remain fixed "
                 "at `initial_dof=%s`. Set `negative_gradient_method='bh'` to "
                 "actually learn dof.",
-                initial_dof,
+                dof_,
             )
-
-        dof_ = initial_dof if dof == "auto" else dof
-        compute_dof_grad = dof == "auto"
 
         for iteration in range(n_iter):
             should_call_callback = (

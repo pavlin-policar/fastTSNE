@@ -209,6 +209,91 @@ class TestDofAutoLearning(unittest.TestCase):
         self.assertGreater(len(dofs), 0)
         self.assertNotEqual(dofs[0], dofs[-1])
 
+    def test_default_dof_no_initial_dof(self):
+        # Path 1: dof=1 (default), initial_dof=None. Dof should stay at 1
+        # throughout, no warnings about initial_dof.
+        history = []
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            TSNE_BH(
+                early_exaggeration_iter=0,
+                n_iter=10,
+                callbacks=history.append,
+                callbacks_every_iters=1,
+            ).fit(self.x)
+        self.assertTrue(all(s.dof == 1.0 for s in history))
+        self.assertFalse(
+            any("initial_dof" in str(w.message) for w in caught),
+            f"Did not expect initial_dof warning, got: {[str(w.message) for w in caught]}",
+        )
+
+    def test_fixed_dof_with_initial_dof_warns(self):
+        # Path 2: dof=1 (fixed), initial_dof=5. initial_dof must be ignored
+        # and a warning must be emitted.
+        history = []
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            TSNE_BH(
+                initial_dof=5.0,
+                early_exaggeration_iter=0,
+                n_iter=10,
+                callbacks=history.append,
+                callbacks_every_iters=1,
+            ).fit(self.x)
+        self.assertTrue(
+            any("initial_dof" in str(w.message) for w in caught),
+            f"Expected initial_dof warning, got: {[str(w.message) for w in caught]}",
+        )
+        self.assertTrue(all(s.dof == 1.0 for s in history))
+
+    def test_nondefault_fixed_dof_with_initial_dof_warns(self):
+        # Path 2b: dof=2.5 (non-default fixed), initial_dof=5. Same warning;
+        # dof stays at 2.5.
+        history = []
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            TSNE_BH(
+                dof=2.5,
+                initial_dof=5.0,
+                early_exaggeration_iter=0,
+                n_iter=10,
+                callbacks=history.append,
+                callbacks_every_iters=1,
+            ).fit(self.x)
+        self.assertTrue(
+            any("initial_dof" in str(w.message) for w in caught),
+            f"Expected initial_dof warning, got: {[str(w.message) for w in caught]}",
+        )
+        self.assertTrue(all(s.dof == 2.5 for s in history))
+
+    def test_auto_dof_no_initial_dof_starts_from_one(self):
+        # Path 3: dof="auto", initial_dof=None. Starting dof must default to 1.
+        history = []
+        TSNE_BH(
+            dof="auto",
+            early_exaggeration_iter=0,
+            n_iter=2,
+            callbacks=history.append,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        self.assertGreater(len(history), 0)
+        # First iteration's `dof` is the starting value before any update.
+        self.assertEqual(history[0].dof, 1.0)
+
+    def test_auto_dof_with_initial_dof_starts_from_initial(self):
+        # Path 4: dof="auto", initial_dof=5. Starting dof must be 5.
+        history = []
+        TSNE_BH(
+            dof="auto",
+            initial_dof=5.0,
+            early_exaggeration_iter=0,
+            n_iter=2,
+            callbacks=history.append,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        self.assertGreater(len(history), 0)
+        self.assertEqual(history[0].dof, 5.0)
+
     def test_fft_auto_warns_and_keeps_dof_fixed(self):
         # FFT path cannot learn dof; we must warn and dof must remain fixed.
         history = []
