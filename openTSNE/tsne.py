@@ -104,11 +104,11 @@ def _check_callbacks(callbacks):
                 raise ValueError("`callbacks` must contain callable objects!")
         # The gradient descent method deals with lists
         elif callable(callbacks):
-            callbacks = (callbacks,)
+            callbacks = [callbacks]
         else:
             raise ValueError("`callbacks` must be a callable object!")
 
-        callbacks = tuple(_adapt_callback(c) for c in callbacks)
+        callbacks = [_adapt_callback(c) for c in callbacks]
 
     return callbacks
 
@@ -351,6 +351,7 @@ class PartialTSNEEmbedding(np.ndarray):
         obj.optimizer = optimizer
 
         obj.kl_divergence = None
+        obj.dof_ = None
 
         return obj
 
@@ -637,6 +638,11 @@ class TSNEEmbedding(np.ndarray):
         obj.optimizer = optimizer
 
         obj.kl_divergence = None
+
+        # Learned degrees-of-freedom value, populated when `dof="auto"`. Carried
+        # across consecutive `optimize()` calls so the optimizer resumes from
+        # where the previous run left off.
+        obj.dof_ = None
 
         # Interpolation grid variables
         obj.interp_coeffs = None
@@ -1077,10 +1083,21 @@ class TSNEEmbedding(np.ndarray):
             self.interp_coeffs,
             self.box_x_lower_bounds,
             self.box_y_lower_bounds,
+            self.dof_,
         )
         return state[0], state[1], new_state
 
     def __setstate__(self, state):
+        # state layouts (oldest → newest):
+        #   12 elems: no optimizer, no dof_      (very old pickles)
+        #   13 elems: with optimizer, no dof_    (pre learnable-dof)
+        #   14 elems: with optimizer and dof_    (current)
+        if len(state) >= 14:
+            self.dof_ = state[-1]
+            state = state[:-1]
+        else:
+            self.dof_ = None
+
         self.box_y_lower_bounds = state[-1]
         self.box_x_lower_bounds = state[-2]
         self.interp_coeffs = state[-3]
@@ -1946,7 +1963,16 @@ class gradient_descent:
             start_time = time()
 
         if dof == "auto":
-            dof_ = 1.0 if initial_dof is None else initial_dof
+            # Resume from a previously learned value if the embedding has one,
+            # otherwise start from `initial_dof` (or 1.0 by default). This lets
+            # consecutive `optimize()` calls (e.g. early-exag → main) continue
+            # learning rather than resetting on each call.
+            if embedding.dof_ is not None:
+                dof_ = embedding.dof_
+            elif initial_dof is not None:
+                dof_ = initial_dof
+            else:
+                dof_ = 1.0
             compute_dof_grad = True
         else:
             if initial_dof is not None:
@@ -2098,6 +2124,11 @@ class gradient_descent:
                 start_time = time()
 
         timer.__exit__()
+
+        # Persist the learned dof on the embedding so the next `optimize()`
+        # call resumes from this value instead of restarting from `initial_dof`.
+        if dof == "auto":
+            embedding.dof_ = dof_
 
         # Make sure to un-exaggerate P so it's not corrupted in future runs
         if exaggeration != 1:

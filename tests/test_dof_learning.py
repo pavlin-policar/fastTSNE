@@ -294,6 +294,51 @@ class TestDofAutoLearning(unittest.TestCase):
         self.assertGreater(len(history), 0)
         self.assertEqual(history[0].dof, 5.0)
 
+    def test_embedding_dof_attribute_set_only_for_auto(self):
+        # `embedding.dof_` is the persisted learned value: it must be a float
+        # after fitting with `dof="auto"` and remain `None` for any fixed dof.
+        fixed_default = TSNE_BH(
+            early_exaggeration_iter=0, n_iter=5,
+        ).fit(self.x)
+        self.assertIsNone(fixed_default.dof_)
+
+        fixed_nondefault = TSNE_BH(
+            dof=2.5, early_exaggeration_iter=0, n_iter=5,
+        ).fit(self.x)
+        self.assertIsNone(fixed_nondefault.dof_)
+
+        learned = TSNE_BH(
+            dof="auto", early_exaggeration_iter=0, n_iter=5,
+        ).fit(self.x)
+        self.assertIsInstance(learned.dof_, float)
+
+    def test_auto_dof_resumes_across_optimize_calls(self):
+        # The learned dof must persist on the embedding so a subsequent
+        # `optimize()` call resumes from the last learned value rather than
+        # restarting from `initial_dof`. Critically, this is the path that
+        # `TSNE.fit` itself takes between early-exag and the main optimization.
+        embedding = TSNE_BH(
+            dof="auto",
+            initial_dof=5.0,
+            early_exaggeration_iter=0,
+            n_iter=20,
+        ).fit(self.x)
+
+        learned_dof = embedding.dof_
+        self.assertIsNotNone(learned_dof)
+        # Sanity: actual learning happened, so the stored value is no longer
+        # the initial 5.0 — otherwise the resume assertion below is vacuous.
+        self.assertNotEqual(learned_dof, 5.0)
+
+        history = []
+        embedding.optimize(
+            n_iter=2,
+            inplace=True,
+            callbacks=history.append,
+            callbacks_every_iters=1,
+        )
+        self.assertEqual(history[0].dof, learned_dof)
+
     def test_fft_auto_warns_and_keeps_dof_fixed(self):
         # FFT path cannot learn dof; we must warn and dof must remain fixed.
         history = []
