@@ -5,7 +5,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 from openTSNE import kl_divergence
-from openTSNE.tsne import TSNEEmbedding
+from openTSNE.tsne import IterationState, TSNEEmbedding
 
 log = logging.getLogger(__name__)
 
@@ -14,19 +14,17 @@ class Callback:
     def optimization_about_to_start(self):
         """This is called at the beginning of the optimization procedure."""
 
-    def __call__(self, iteration, error, embedding):
+    def __call__(self, state: IterationState):
         """This is the main method called from the optimization.
 
         Parameters
         ----------
-        iteration: int
-            The current iteration number.
-
-        error: float
-            The current KL divergence of the given embedding.
-
-        embedding: TSNEEmbedding
-            The current t-SNE embedding.
+        state: IterationState
+            Per-iteration snapshot containing the iteration number, the current
+            embedding and gradient (both copies), the error, the current
+            exaggeration factor, and the degrees-of-freedom value and gradient.
+            See :class:`openTSNE.tsne.IterationState` for the full list of
+            fields.
 
         Returns
         -------
@@ -46,14 +44,9 @@ class VerifyExaggerationError(Callback):
         # Keep a copy of the unexaggerated affinity matrix
         self.P = self.embedding.affinities.P.copy()
 
-    def __call__(
-        self, iteration: int, corrected_error: float, embedding: TSNEEmbedding
-    ):
+    def __call__(self, state: IterationState):
         params = self.embedding.gradient_descent_params
         method = params["negative_gradient_method"]
-
-        if np.sum(embedding.affinities.P) <= 1:
-            log.warning("Are you sure you are testing an exaggerated P matrix?")
 
         if method == "fft":
             f = partial(
@@ -72,13 +65,13 @@ class VerifyExaggerationError(Callback):
 
         P = self.P
 
-        true_error = f(P.indices, P.indptr, P.data, embedding)
-        if abs(true_error - corrected_error) > 1e-8:
+        true_error = f(P.indices, P.indptr, P.data, state.embedding)
+        if abs(true_error - state.error) > 1e-8:
             raise RuntimeError("Correction term is wrong.")
         else:
             log.info(
                 "Corrected: %.4f - True %.4f [eps %.4f]"
-                % (corrected_error, true_error, abs(true_error - corrected_error))
+                % (state.error, true_error, abs(true_error - state.error))
             )
 
 
@@ -92,7 +85,8 @@ class ErrorApproximations(Callback):
         self.bh_errors = []
         self.fft_errors = []
 
-    def __call__(self, iteration: int, error: float, embedding: TSNEEmbedding):
+    def __call__(self, state: IterationState):
+        embedding = state.embedding
         exact_error = kl_divergence.kl_divergence_exact(self.P.toarray(), embedding)
         bh_error = kl_divergence.kl_divergence_approx_bh(
             self.P.indices, self.P.indptr, self.P.data, embedding

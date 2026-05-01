@@ -3,7 +3,7 @@ import logging
 import multiprocessing
 import warnings
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from time import time
 from types import SimpleNamespace
 
@@ -30,14 +30,70 @@ class GradientResult:
 
 
 @dataclass
-class OptimizationStats:
-    """Dataclass to store optimization statistics."""
+class IterationState:
+    """Per-iteration snapshot passed to optimization callbacks.
 
-    iteration: list = field(default_factory=list)
-    KLs: list = field(default_factory=list)
-    alphas: list = field(default_factory=list)
-    alpha_gradients: list = field(default_factory=list)
-    embeddings: list = field(default_factory=list)
+    Constructed only when a callback fires, and contains copies of the
+    embedding and gradient so callbacks can safely retain the state.
+    """
+
+    iteration: int
+    exaggeration: float
+    embedding: np.ndarray
+    gradient: np.ndarray
+    error: float
+    dof: float
+    dof_grad: float
+
+
+def _adapt_callback(c):
+    """Wrap a user callback so the optimizer can always invoke it as `c(state)`.
+
+    Old-style 3-arg callbacks `c(iteration, error, embedding)` are still
+    accepted but emit a FutureWarning at registration time.
+    """
+    try:
+        sig = inspect.signature(c)
+    except (TypeError, ValueError):
+        # Builtins or C-extensions without introspectable signatures: assume new style.
+        return c
+
+    required = [
+        p for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        and p.default is inspect.Parameter.empty
+    ]
+    n_required = len(required)
+    accepts_var_positional = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+    )
+
+    if n_required == 1 or (n_required == 0 and accepts_var_positional):
+        return c
+    if n_required == 3:
+        warnings.warn(
+            "Callbacks taking (iteration, error, embedding) are deprecated and "
+            "will be removed in a future release. Switch to a single-argument "
+            "callback `callback(state: IterationState)` to access the full "
+            "per-iteration state (including dof, gradient, exaggeration, etc.).",
+            FutureWarning,
+            stacklevel=3,
+        )
+
+        def wrapped(state, _c=c):
+            return _c(state.iteration, state.error, state.embedding)
+
+        # Preserve the optimization_about_to_start hook (used by class-based
+        # callbacks subclassing `Callback`) so it still fires through the wrapper.
+        if hasattr(c, "optimization_about_to_start"):
+            wrapped.optimization_about_to_start = c.optimization_about_to_start
+        return wrapped
+    raise TypeError(
+        "Callback must accept either a single IterationState argument or the "
+        "deprecated (iteration, error, embedding) signature; got a callable "
+        f"requiring {n_required} positional arguments."
+    )
 
 
 def _check_callbacks(callbacks):
@@ -51,6 +107,8 @@ def _check_callbacks(callbacks):
             callbacks = (callbacks,)
         else:
             raise ValueError("`callbacks` must be a callable object!")
+
+        callbacks = tuple(_adapt_callback(c) for c in callbacks)
 
     return callbacks
 
@@ -240,8 +298,14 @@ class PartialTSNEEmbedding(np.ndarray):
         scikit-learn convention, ``-1`` meaning all processors, ``-2`` meaning
         all but one, etc.
 
-    callbacks: Callable[[int, float, np.ndarray] -> bool]
+    callbacks: Callable[[IterationState], bool]
         Callbacks, which will be run every ``callbacks_every_iters`` iterations.
+        Each callback receives an :class:`IterationState` snapshot containing
+        the current iteration, embedding, gradient, error, exaggeration, and
+        degrees-of-freedom values. Returning ``True`` from any callback will
+        interrupt the optimization. The legacy three-argument signature
+        ``callback(iteration, error, embedding)`` is still accepted but emits a
+        ``FutureWarning`` and will be removed in a future release.
 
     callbacks_every_iters: int
         How many iterations should pass between each time the callbacks are
@@ -364,9 +428,15 @@ class PartialTSNEEmbedding(np.ndarray):
             scikit-learn convention, ``-1`` meaning all processors, ``-2``
             meaning all but one, etc.
 
-        callbacks: Callable[[int, float, np.ndarray] -> bool]
+        callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
-            iterations.
+            iterations. Each callback receives an :class:`IterationState`
+            snapshot containing the current iteration, embedding, gradient,
+            error, exaggeration, and degrees-of-freedom values. Returning
+            ``True`` from any callback will interrupt the optimization.
+            The legacy three-argument signature
+            ``callback(iteration, error, embedding)`` is still accepted but
+            emits a ``FutureWarning`` and will be removed in a future release.
 
         callbacks_every_iters: int
             How many iterations should pass between each time the callbacks are
@@ -406,7 +476,7 @@ class PartialTSNEEmbedding(np.ndarray):
         try:
             # Run gradient descent with the embedding optimizer so gains are
             # properly updated and kept
-            error, embedding, optimization_stats = embedding.optimizer(
+            error, embedding = embedding.optimizer(
                 embedding=embedding,
                 reference_embedding=self.reference_embedding,
                 P=self.P,
@@ -502,8 +572,14 @@ class TSNEEmbedding(np.ndarray):
         scikit-learn convention, ``-1`` meaning all processors, ``-2`` meaning
         all but one, etc.
 
-    callbacks: Callable[[int, float, np.ndarray] -> bool]
+    callbacks: Callable[[IterationState], bool]
         Callbacks, which will be run every ``callbacks_every_iters`` iterations.
+        Each callback receives an :class:`IterationState` snapshot containing
+        the current iteration, embedding, gradient, error, exaggeration, and
+        degrees-of-freedom values. Returning ``True`` from any callback will
+        interrupt the optimization. The legacy three-argument signature
+        ``callback(iteration, error, embedding)`` is still accepted but emits a
+        ``FutureWarning`` and will be removed in a future release.
 
     callbacks_every_iters: int
         How many iterations should pass between each time the callbacks are
@@ -566,7 +642,6 @@ class TSNEEmbedding(np.ndarray):
         obj.interp_coeffs = None
         obj.box_x_lower_bounds = None
         obj.box_y_lower_bounds = None
-        obj.optimization_stats = None
         return obj
 
     def optimize(
@@ -662,9 +737,15 @@ class TSNEEmbedding(np.ndarray):
             scikit-learn convention, ``-1`` meaning all processors, ``-2``
             meaning all but one, etc.
 
-        callbacks: Callable[[int, float, np.ndarray] -> bool]
+        callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
-            iterations.
+            iterations. Each callback receives an :class:`IterationState`
+            snapshot containing the current iteration, embedding, gradient,
+            error, exaggeration, and degrees-of-freedom values. Returning
+            ``True`` from any callback will interrupt the optimization.
+            The legacy three-argument signature
+            ``callback(iteration, error, embedding)`` is still accepted but
+            emits a ``FutureWarning`` and will be removed in a future release.
 
         callbacks_every_iters: int
             How many iterations should pass between each time the callbacks are
@@ -704,7 +785,7 @@ class TSNEEmbedding(np.ndarray):
         try:
             # Run gradient descent with the embedding optimizer so gains are
             # properly updated and kept
-            error, embedding, optimization_stats = embedding.optimizer(
+            error, embedding = embedding.optimizer(
                 embedding=embedding, P=self.affinities.P, **optim_params
             )
 
@@ -715,7 +796,6 @@ class TSNEEmbedding(np.ndarray):
             error, embedding = ex.error, ex.final_embedding
 
         embedding.kl_divergence = error
-        embedding.optimization_stats = optimization_stats
 
         return embedding
 
@@ -1776,9 +1856,15 @@ class gradient_descent:
 
         use_callbacks: bool
 
-        callbacks: Callable[[int, float, np.ndarray] -> bool]
+        callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
-            iterations.
+            iterations. Each callback receives an :class:`IterationState`
+            snapshot containing the current iteration, embedding, gradient,
+            error, exaggeration, and degrees-of-freedom values. Returning
+            ``True`` from any callback will interrupt the optimization.
+            The legacy three-argument signature
+            ``callback(iteration, error, embedding)`` is still accepted but
+            emits a ``FutureWarning`` and will be removed in a future release.
 
         callbacks_every_iters: int
             How many iterations should pass between each time the callbacks are
@@ -1861,13 +1947,6 @@ class gradient_descent:
 
         if verbose:
             start_time = time()
-        optimization_stats = OptimizationStats(
-            iteration=[],
-            alphas=[],
-            alpha_gradients=[],
-            KLs=[],
-            embeddings=[],
-        )
 
         if dof == "auto" and objective_function is kl_divergence_fft:
             log.warning(
@@ -1906,10 +1985,9 @@ class gradient_descent:
             gradient = result.gradient
             dof_grad = result.dof_grad
 
-            optimization_stats.iteration.append(iteration)
-            optimization_stats.alphas.append(dof_)
-            optimization_stats.KLs.append(error)
-            optimization_stats.embeddings.append(embedding)
+            # Snapshot the raw gradient before any in-place modification so the
+            # callback sees what the objective actually returned.
+            gradient_snapshot = gradient.copy() if should_call_callback else None
 
             # Clip gradients to avoid points shooting off. This can be an issue
             # when applying transform and points are initialized so that the new
@@ -1926,25 +2004,28 @@ class gradient_descent:
                 error = error / exaggeration - np.log(exaggeration)
 
             if should_call_callback:
-                # Continue only if all the callbacks say so
-                should_stop = any(
-                    (bool(c(iteration + 1, error, embedding)) for c in callbacks)
+                state = IterationState(
+                    iteration=iteration + 1,
+                    exaggeration=exaggeration,
+                    embedding=embedding.copy(),
+                    gradient=gradient_snapshot,
+                    error=error,
+                    dof=dof_,
+                    dof_grad=dof_grad,
                 )
+                # Continue only if all the callbacks say so
+                should_stop = any(bool(c(state)) for c in callbacks)
                 if should_stop:
                     # Make sure to un-exaggerate P so it's not corrupted in future runs
                     if exaggeration != 1:
                         P /= exaggeration
                     raise OptimizationInterrupt(error=error, final_embedding=embedding)
 
-            # === DOF UPDATE ===
-
+            # === DOF UPDATE (delta-bar-delta) ===
             if dof == "auto":
-                # === DoF UPDATE WITH DELTA-BAR-DELTA ===
-                # Delta-bar-delta: check if gradient direction changed
                 dof_grad_direction_flipped = np.sign(self.dof_update) != np.sign(
                     dof_grad
                 )
-
                 if dof_grad_direction_flipped:
                     self.dof_gain += 0.2
                 else:
@@ -1952,20 +2033,14 @@ class gradient_descent:
 
                 # Normalize learning rate by n_samples to get appropriate scale for DoF
                 n_samples = embedding.shape[0]
-
                 dof_lr = (
                     learning_rate / n_samples
                 )  # <<<< This is just 1 with default settings
 
-                # Update DoF with momentum and adaptive gain
                 self.dof_update = (
                     momentum * self.dof_update - dof_lr * self.dof_gain * dof_grad
                 )
                 dof_ += self.dof_update
-
-                optimization_stats.alpha_gradients.append(self.dof_update)
-            else:
-                optimization_stats.alpha_gradients.append(0)
             # === END DOF UPDATE ===
 
             # Update the embedding using the gradient
@@ -2009,14 +2084,8 @@ class gradient_descent:
             if verbose and (iteration + 1) % 50 == 0:
                 stop_time = time()
                 print(
-                    "Iteration %4d, KL divergence %6.4f, DoF %6.4f, DoF gradient %6.4f, 50 iterations in %.4f sec"
-                    % (
-                        iteration + 1,
-                        error,
-                        dof_,
-                        self.dof_update,
-                        stop_time - start_time,
-                    )
+                    "Iteration %4d, KL divergence %6.4f, 50 iterations in %.4f sec"
+                    % (iteration + 1, error, stop_time - start_time)
                 )
                 start_time = time()
 
@@ -2041,4 +2110,4 @@ class gradient_descent:
             compute_dof_grad=False,
         )
 
-        return result.error, embedding, optimization_stats
+        return result.error, embedding

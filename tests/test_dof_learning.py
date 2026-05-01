@@ -1,6 +1,7 @@
 """Tests for the learnable degrees-of-freedom feature."""
 import logging
 import unittest
+import warnings
 from functools import partial
 
 import numpy as np
@@ -10,7 +11,7 @@ import openTSNE
 from openTSNE import affinity
 from openTSNE.tsne import (
     GradientResult,
-    OptimizationStats,
+    IterationState,
     kl_divergence_bh,
     kl_divergence_fft,
 )
@@ -182,12 +183,10 @@ class TestOptimizerReturnShape(unittest.TestCase):
     def setUpClass(cls):
         cls.x = datasets.load_iris()["data"]
 
-    def test_optimize_returns_three_tuple(self):
-        # The optimizer's outer return is (error, embedding, optimization_stats).
+    def test_fit_returns_embedding_with_kl(self):
         emb = TSNE_BH(early_exaggeration_iter=5, n_iter=5).fit(self.x)
         self.assertTrue(hasattr(emb, "kl_divergence"))
-        self.assertTrue(hasattr(emb, "optimization_stats"))
-        self.assertIsInstance(emb.optimization_stats, OptimizationStats)
+        self.assertTrue(np.isfinite(emb.kl_divergence))
 
 
 class TestDofAutoLearning(unittest.TestCase):
@@ -197,32 +196,141 @@ class TestDofAutoLearning(unittest.TestCase):
 
     def test_bh_auto_actually_moves_dof(self):
         # With dof="auto" on the BH path, dof should change over iterations.
-        emb = TSNE_BH(
+        history = []
+        TSNE_BH(
             dof="auto",
             initial_dof=1.0,
             early_exaggeration_iter=0,
             n_iter=30,
+            callbacks=history.append,
+            callbacks_every_iters=1,
         ).fit(self.x)
-        alphas = emb.optimization_stats.alphas
-        self.assertGreater(len(alphas), 0)
-        # First recorded alpha is the initial; final should differ.
-        self.assertNotEqual(alphas[0], alphas[-1])
+        dofs = [s.dof for s in history]
+        self.assertGreater(len(dofs), 0)
+        self.assertNotEqual(dofs[0], dofs[-1])
 
     def test_fft_auto_warns_and_keeps_dof_fixed(self):
         # FFT path cannot learn dof; we must warn and dof must remain fixed.
+        history = []
         with self.assertLogs("openTSNE.tsne", level="WARNING") as cm:
-            emb = TSNE_FFT(
+            TSNE_FFT(
                 dof="auto",
                 initial_dof=1.0,
                 early_exaggeration_iter=0,
                 n_iter=20,
+                callbacks=history.append,
+                callbacks_every_iters=1,
             ).fit(self.x)
         self.assertTrue(
             any("dof='auto'" in msg or "Barnes-Hut" in msg for msg in cm.output),
             f"Expected dof-auto warning, got: {cm.output}",
         )
-        alphas = emb.optimization_stats.alphas
-        self.assertTrue(all(a == 1.0 for a in alphas))
+        self.assertTrue(all(s.dof == 1.0 for s in history))
+
+
+class TestIterationStateCallback(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.x = datasets.load_iris()["data"]
+
+    def test_callback_receives_iteration_state(self):
+        seen = []
+        TSNE_BH(
+            early_exaggeration_iter=0,
+            n_iter=5,
+            callbacks=seen.append,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        self.assertEqual(len(seen), 5)
+        for state in seen:
+            self.assertIsInstance(state, IterationState)
+            self.assertEqual(state.embedding.shape[1], 2)
+            self.assertEqual(state.gradient.shape, state.embedding.shape)
+            self.assertTrue(np.isfinite(state.error))
+
+    def test_callback_state_is_a_copy(self):
+        # Callback must receive snapshots so retained state doesn't mutate.
+        seen = []
+        TSNE_BH(
+            early_exaggeration_iter=0,
+            n_iter=3,
+            callbacks=seen.append,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        # Embeddings on consecutive iters must differ (optimizer moved).
+        self.assertFalse(np.array_equal(seen[0].embedding, seen[-1].embedding))
+        # And the snapshot arrays must not alias each other.
+        self.assertIsNot(seen[0].embedding, seen[-1].embedding)
+
+    def test_old_three_arg_callback_still_works_with_warning(self):
+        calls = []
+
+        def old_callback(iteration, error, embedding):
+            calls.append((iteration, error, embedding.shape))
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            TSNE_BH(
+                early_exaggeration_iter=0,
+                n_iter=5,
+                callbacks=old_callback,
+                callbacks_every_iters=1,
+            ).fit(self.x)
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(
+            any(issubclass(w.category, FutureWarning) for w in caught),
+            f"Expected FutureWarning, got: {[w.category for w in caught]}",
+        )
+
+    def test_optimization_about_to_start_fires_for_new_style_callback(self):
+        # Class-based callback with the new IterationState signature.
+        class MyCallback:
+            def __init__(self):
+                self.start_calls = 0
+                self.iter_calls = 0
+
+            def optimization_about_to_start(self):
+                self.start_calls += 1
+
+            def __call__(self, state):
+                self.iter_calls += 1
+
+        cb = MyCallback()
+        TSNE_BH(
+            early_exaggeration_iter=5,
+            n_iter=5,
+            callbacks=cb,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        # Standard fit calls .optimize() twice (early exaggeration + main).
+        self.assertEqual(cb.start_calls, 2)
+        self.assertGreater(cb.iter_calls, 0)
+
+    def test_optimization_about_to_start_fires_for_old_style_callback(self):
+        # Class-based callback wrapped by the deprecation adapter must still
+        # have its `optimization_about_to_start` hook invoked.
+        class MyOldCallback:
+            def __init__(self):
+                self.start_calls = 0
+                self.iter_calls = 0
+
+            def optimization_about_to_start(self):
+                self.start_calls += 1
+
+            def __call__(self, iteration, error, embedding):
+                self.iter_calls += 1
+
+        cb = MyOldCallback()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            TSNE_BH(
+                early_exaggeration_iter=5,
+                n_iter=5,
+                callbacks=cb,
+                callbacks_every_iters=1,
+            ).fit(self.x)
+        self.assertEqual(cb.start_calls, 2)
+        self.assertGreater(cb.iter_calls, 0)
 
 
 if __name__ == "__main__":
