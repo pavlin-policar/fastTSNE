@@ -294,23 +294,25 @@ class TestDofAutoLearning(unittest.TestCase):
         self.assertGreater(len(history), 0)
         self.assertEqual(history[0].dof, 5.0)
 
-    def test_embedding_dof_attribute_set_only_for_auto(self):
-        # `embedding.dof_` is the persisted learned value: it must be a float
-        # after fitting with `dof="auto"` and remain `None` for any fixed dof.
+    def test_embedding_dof_attribute_always_set(self):
+        # Every fitted embedding exposes the dof it was optimized with: the
+        # fixed value for fixed dof, the learned value for `dof="auto"`. This
+        # lets consumers read `embedding.dof_` without branching on the mode.
         fixed_default = TSNE_BH(
             early_exaggeration_iter=0, n_iter=5,
         ).fit(self.x)
-        self.assertIsNone(fixed_default.dof_)
+        self.assertEqual(fixed_default.dof_, 1.0)
 
         fixed_nondefault = TSNE_BH(
             dof=2.5, early_exaggeration_iter=0, n_iter=5,
         ).fit(self.x)
-        self.assertIsNone(fixed_nondefault.dof_)
+        self.assertEqual(fixed_nondefault.dof_, 2.5)
 
         learned = TSNE_BH(
             dof="auto", early_exaggeration_iter=0, n_iter=5,
         ).fit(self.x)
         self.assertIsInstance(learned.dof_, float)
+        self.assertNotEqual(learned.dof_, 1.0)
 
     def test_auto_dof_resumes_across_optimize_calls(self):
         # The learned dof must persist on the embedding so a subsequent
@@ -377,6 +379,36 @@ class TestIterationStateCallback(unittest.TestCase):
             self.assertEqual(state.embedding.shape[1], 2)
             self.assertEqual(state.gradient.shape, state.embedding.shape)
             self.assertTrue(np.isfinite(state.error))
+
+    def test_state_embedding_is_tsne_embedding_with_dof(self):
+        # Each snapshot must remain a TSNEEmbedding (so consumers can call
+        # `optimizer`, `affinities`, etc. on it later) and carry the dof from
+        # that iteration.
+        from openTSNE import TSNEEmbedding
+
+        seen_fixed = []
+        TSNE_BH(
+            dof=2.5,
+            early_exaggeration_iter=0,
+            n_iter=3,
+            callbacks=seen_fixed.append,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        for state in seen_fixed:
+            self.assertIsInstance(state.embedding, TSNEEmbedding)
+            self.assertEqual(state.embedding.dof_, 2.5)
+
+        seen_auto = []
+        TSNE_BH(
+            dof="auto",
+            early_exaggeration_iter=0,
+            n_iter=3,
+            callbacks=seen_auto.append,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        for state in seen_auto:
+            self.assertIsInstance(state.embedding, TSNEEmbedding)
+            self.assertEqual(state.embedding.dof_, state.dof)
 
     def test_callback_state_is_a_copy(self):
         # Callback must receive snapshots so retained state doesn't mutate.
