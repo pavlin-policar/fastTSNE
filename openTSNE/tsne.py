@@ -1167,34 +1167,72 @@ class TSNEEmbedding(np.ndarray):
                 "Prepare interpolation grid function returned >3 values!"
             )
 
+    # Sentinel marking the start of openTSNE-specific pickle state. The
+    # numpy ndarray pickle state is a tuple of opaque values, so we append a
+    # single tagged dict as the last element. This lets us evolve the schema
+    # by bumping `_PICKLE_VERSION` without relying on the tuple length.
+    _PICKLE_SENTINEL = "__openTSNE_TSNEEmbedding__"
+    _PICKLE_VERSION = 2
+
     def __reduce__(self):
         state = super().__reduce__()
-        new_state = state[2] + (
-            self.optimizer,
-            self.affinities,
-            self.gradient_descent_params,
-            self.random_state,
-            self.kl_divergence_,
-            self.interp_coeffs,
-            self.box_x_lower_bounds,
-            self.box_y_lower_bounds,
-            self.dof_,
-            self.optimization_iters_,
-        )
+        payload = {
+            "_sentinel": self._PICKLE_SENTINEL,
+            "_version": self._PICKLE_VERSION,
+            "optimizer": self.optimizer,
+            "affinities": self.affinities,
+            "gradient_descent_params": self.gradient_descent_params,
+            "random_state": self.random_state,
+            "kl_divergence_": self.kl_divergence_,
+            "interp_coeffs": self.interp_coeffs,
+            "box_x_lower_bounds": self.box_x_lower_bounds,
+            "box_y_lower_bounds": self.box_y_lower_bounds,
+            "dof_": self.dof_,
+            "optimization_iters_": self.optimization_iters_,
+        }
+        new_state = state[2] + (payload,)
         return state[0], state[1], new_state
 
     def __setstate__(self, state):
-        # state layouts (oldest → newest):
-        #   12 elems: no optimizer, no dof_, no optimization_iters_
-        #   13 elems: with optimizer, no dof_, no optimization_iters_
-        #   15 elems: with optimizer, dof_, and optimization_iters_  (current)
-        if len(state) >= 15:
-            self.optimization_iters_ = state[-1]
-            self.dof_ = state[-2]
-            state = state[:-2]
-        else:
-            self.optimization_iters_ = 0
-            self.dof_ = None
+        if (
+            isinstance(state[-1], dict)
+            and state[-1].get("_sentinel") == self._PICKLE_SENTINEL
+        ):
+            payload = state[-1]
+            version = payload.get("_version")
+            if version == 2:
+                self._restore_v2(payload)
+                super().__setstate__(state[:-1])
+                return
+            raise ValueError(
+                f"Unsupported TSNEEmbedding pickle version: {version!r}. "
+                "This pickle was produced by a newer openTSNE."
+            )
+
+        # Legacy (pre-versioning) tuple layouts. Kept for backwards
+        # compatibility with pickles produced before the sentinel was added.
+        self._restore_legacy(state)
+
+    def _restore_v2(self, payload):
+        self.optimizer = payload["optimizer"]
+        self.affinities = payload["affinities"]
+        self.gradient_descent_params = payload["gradient_descent_params"]
+        self.random_state = payload["random_state"]
+        self.kl_divergence_ = payload["kl_divergence_"]
+        self.interp_coeffs = payload["interp_coeffs"]
+        self.box_x_lower_bounds = payload["box_x_lower_bounds"]
+        self.box_y_lower_bounds = payload["box_y_lower_bounds"]
+        self.dof_ = payload["dof_"]
+        self.optimization_iters_ = payload["optimization_iters_"]
+
+    def _restore_legacy(self, state):
+        # Pre-sentinel layouts (oldest → newest):
+        #   12 elems: no optimizer (early bug — `gradient_descent` was missing
+        #             from the pickle).
+        #   13 elems: with optimizer (added later).
+        # Neither layout knew about `dof_` or `optimization_iters_`.
+        self.dof_ = None
+        self.optimization_iters_ = 0
 
         self.box_y_lower_bounds = state[-1]
         self.box_x_lower_bounds = state[-2]
@@ -1204,12 +1242,17 @@ class TSNEEmbedding(np.ndarray):
         self.gradient_descent_params = state[-6]
         self.affinities = state[-7]
 
-        if len(state) == 12:  # backwards compat (when I forgot optimizer)
+        if len(state) == 12:
             self.optimizer = gradient_descent()
             super().__setstate__(state[:-7])
-        else:
+        elif len(state) == 13:
             self.optimizer = state[-8]
             super().__setstate__(state[:-8])
+        else:
+            raise ValueError(
+                f"Unrecognized legacy TSNEEmbedding pickle layout "
+                f"(length={len(state)})."
+            )
 
     @property
     def kl_divergence(self):
