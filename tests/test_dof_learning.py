@@ -294,6 +294,48 @@ class TestDofAutoLearning(unittest.TestCase):
         self.assertGreater(len(history), 0)
         self.assertEqual(history[0].dof, 5.0)
 
+    def test_fixed_then_auto_resumes_from_fixed(self):
+        # Switching from a fixed dof to dof="auto" must pick up at the fixed
+        # value, so the user can use a fixed-dof phase as a warm start for
+        # subsequent dof learning. `initial_dof` is ignored on resume — it
+        # only applies when the embedding has no prior dof.
+        embedding = TSNE_BH(
+            dof=5.0, early_exaggeration_iter=0, n_iter=10,
+        ).fit(self.x)
+        self.assertEqual(embedding.dof_, 5.0)
+
+        history = []
+        embedding.optimize(
+            n_iter=2,
+            dof="auto",
+            inplace=True,
+            callbacks=history.append,
+            callbacks_every_iters=1,
+        )
+        self.assertEqual(history[0].dof, 5.0)
+
+    def test_auto_then_fixed_overrides_dof(self):
+        # Reverse direction: after learning dof, the user pins it. The fixed
+        # value must take effect immediately (visible to the very first
+        # iteration) and be reflected on the embedding afterwards.
+        embedding = TSNE_BH(
+            dof="auto", early_exaggeration_iter=0, n_iter=10,
+        ).fit(self.x)
+        learned = embedding.dof_
+        self.assertIsInstance(learned, float)
+        self.assertNotEqual(learned, 7.0)
+
+        history = []
+        embedding.optimize(
+            n_iter=2,
+            dof=7.0,
+            inplace=True,
+            callbacks=history.append,
+            callbacks_every_iters=1,
+        )
+        self.assertEqual(history[0].dof, 7.0)
+        self.assertEqual(embedding.dof_, 7.0)
+
     def test_embedding_dof_attribute_always_set(self):
         # Every fitted embedding exposes the dof it was optimized with: the
         # fixed value for fixed dof, the learned value for `dof="auto"`. This
@@ -493,6 +535,99 @@ class TestIterationStateCallback(unittest.TestCase):
             ).fit(self.x)
         self.assertEqual(cb.start_calls, 2)
         self.assertGreater(cb.iter_calls, 0)
+
+
+class TestOptimizationItersTracking(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.x = datasets.load_iris()["data"]
+
+    def test_initialized_to_zero(self):
+        from openTSNE import TSNEEmbedding
+        from openTSNE import affinity, initialization
+
+        aff = affinity.PerplexityBasedNN(self.x, perplexity=15, random_state=42)
+        init = initialization.pca(self.x, random_state=42)
+        embedding = TSNEEmbedding(init, aff, negative_gradient_method="bh")
+        self.assertEqual(embedding.optimization_iters_, 0)
+
+    def test_accumulates_across_optimize_calls(self):
+        embedding = TSNE_BH(
+            early_exaggeration_iter=0, n_iter=10,
+        ).fit(self.x)
+        self.assertEqual(embedding.optimization_iters_, 10)
+
+        embedding.optimize(n_iter=15, inplace=True)
+        self.assertEqual(embedding.optimization_iters_, 25)
+
+        embedding.optimize(n_iter=7, inplace=True)
+        self.assertEqual(embedding.optimization_iters_, 32)
+
+    def test_accumulates_across_non_inplace_optimize_calls(self):
+        # The default optimize() returns a fresh embedding; the counter must
+        # carry over to the new instance, not reset to zero.
+        embedding = TSNE_BH(
+            early_exaggeration_iter=0, n_iter=10,
+        ).fit(self.x)
+        self.assertEqual(embedding.optimization_iters_, 10)
+
+        embedding2 = embedding.optimize(n_iter=15)
+        self.assertEqual(embedding2.optimization_iters_, 25)
+        # The original is untouched.
+        self.assertEqual(embedding.optimization_iters_, 10)
+
+        embedding3 = embedding2.optimize(n_iter=7)
+        self.assertEqual(embedding3.optimization_iters_, 32)
+
+    def test_dof_carries_through_non_inplace_optimize(self):
+        # The same copy path must also carry dof_, so dof="auto" resumes from
+        # the prior value across non-inplace optimize() calls (mirroring the
+        # inplace=True behavior covered elsewhere).
+        embedding = TSNE_BH(
+            dof=5.0, early_exaggeration_iter=0, n_iter=10,
+        ).fit(self.x)
+        self.assertEqual(embedding.dof_, 5.0)
+
+        history = []
+        embedding.optimize(
+            n_iter=2,
+            dof="auto",
+            callbacks=history.append,
+            callbacks_every_iters=1,
+        )
+        self.assertEqual(history[0].dof, 5.0)
+
+    def test_callback_sees_monotonic_global_counter(self):
+        # The snapshot's optimization_iters_ must increase monotonically across
+        # consecutive optimize() calls so callbacks can plot a continuous
+        # trajectory.
+        seen = []
+
+        def cb(state):
+            seen.append(state.embedding.optimization_iters_)
+
+        embedding = TSNE_BH(
+            early_exaggeration_iter=0,
+            n_iter=5,
+            callbacks=cb,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        self.assertEqual(seen, [1, 2, 3, 4, 5])
+
+        embedding.optimize(
+            n_iter=4,
+            inplace=True,
+            callbacks=cb,
+            callbacks_every_iters=1,
+        )
+        self.assertEqual(seen, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+    def test_fit_increments_for_both_phases(self):
+        # TSNE.fit calls optimize twice (early-exag + main); both must count.
+        embedding = TSNE_BH(
+            early_exaggeration_iter=7, n_iter=11,
+        ).fit(self.x)
+        self.assertEqual(embedding.optimization_iters_, 18)
 
 
 if __name__ == "__main__":

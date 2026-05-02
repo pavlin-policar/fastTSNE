@@ -1033,6 +1033,14 @@ class TestTSNEEmebedding(unittest.TestCase):
             loaded_obj.transform(x_new), embedding.transform(x_new)
         )
 
+    def test_pickling_preserves_optimization_iters(self):
+        tsne = TSNE(early_exaggeration_iter=3, n_iter=7, random_state=4)
+        embedding = tsne.fit(np.random.randn(100, 4))
+        self.assertEqual(embedding.optimization_iters_, 10)
+
+        loaded = pickle.loads(pickle.dumps(embedding))
+        self.assertEqual(loaded.optimization_iters_, 10)
+
 
 class TestPrecomputedDistanceMatrices(unittest.TestCase):
     def test_precomputed_dist_matrix_via_affinities_uses_spectral_init(self):

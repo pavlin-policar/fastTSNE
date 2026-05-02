@@ -40,6 +40,48 @@ class IterationState:
 
     Constructed only when a callback fires, and contains copies of the
     embedding and gradient so callbacks can safely retain the state.
+
+    Attributes
+    ----------
+    iteration: int
+        The 1-based index of the current iteration *within the active*
+        :func:`optimize` *call*. It always runs from 1 to ``n_iter`` and
+        resets at the start of each new :func:`optimize` call. Use this
+        when you want a per-call milestone (e.g. ``state.iteration == n_iter``
+        to detect the last iteration of a phase). For a global counter that
+        accumulates across consecutive :func:`optimize` calls, read
+        ``state.embedding.optimization_iters_`` instead — that is the right
+        choice when plotting trajectories across an early-exaggeration phase
+        and the main optimization phase, or across any chained
+        :func:`optimize` calls.
+
+    exaggeration: float
+        The exaggeration factor in effect for this iteration.
+
+    embedding: TSNEEmbedding or PartialTSNEEmbedding
+        A snapshot of the embedding at the current iteration. The embedding
+        carries its current ``dof_`` and ``optimization_iters_`` attributes;
+        retaining the snapshot after the callback returns is safe — it is a
+        copy, not the live optimizer state.
+
+    gradient: np.ndarray
+        The raw gradient produced by the objective function this iteration,
+        before any in-place gradient clipping the optimizer may apply.
+
+    error: float
+        The KL divergence at this iteration. Computed only on iterations
+        where the callback fires (and additionally on logging iterations
+        when ``verbose=True``); on other iterations this field is stale.
+
+    dof: float
+        The degrees-of-freedom value used by the kernel this iteration.
+        Equal to the fixed ``dof`` parameter for fixed-dof runs, and to the
+        currently-learned value when ``dof="auto"``.
+
+    dof_grad: float
+        The gradient of the loss with respect to ``dof``. Zero for
+        fixed-dof runs and for the FFT objective (which does not compute
+        the dof gradient).
     """
 
     iteration: int
@@ -305,12 +347,14 @@ class PartialTSNEEmbedding(np.ndarray):
 
     callbacks: Callable[[IterationState], bool]
         Callbacks, which will be run every ``callbacks_every_iters`` iterations.
-        Each callback receives an :class:`IterationState` snapshot containing
-        the current iteration, embedding, gradient, error, exaggeration, and
-        degrees-of-freedom values. Returning ``True`` from any callback will
-        interrupt the optimization. The legacy three-argument signature
-        ``callback(iteration, error, embedding)`` is still accepted but emits a
-        ``FutureWarning`` and will be removed in a future release.
+        Each callback receives an :class:`IterationState` snapshot — see that
+        class for the available fields and the distinction between the
+        per-call ``state.iteration`` counter and the cumulative
+        ``state.embedding.optimization_iters_`` counter. Returning ``True``
+        from any callback will interrupt the optimization. The legacy
+        three-argument signature ``callback(iteration, error, embedding)`` is
+        still accepted but emits a ``FutureWarning`` and will be removed in a
+        future release.
 
     callbacks_every_iters: int
         How many iterations should pass between each time the callbacks are
@@ -325,6 +369,15 @@ class PartialTSNEEmbedding(np.ndarray):
     ----------
     kl_divergence: float
         The KL divergence or error of the embedding.
+
+    dof_: float or None
+        The degrees-of-freedom the embedding was last optimized with. See
+        :class:`IterationState` for details.
+
+    optimization_iters_: int
+        The total number of optimization iterations this embedding has
+        been through, accumulated across consecutive :func:`optimize`
+        calls. See :class:`IterationState` for details.
 
     """
 
@@ -357,6 +410,7 @@ class PartialTSNEEmbedding(np.ndarray):
 
         obj.kl_divergence = None
         obj.dof_ = None
+        obj.optimization_iters_ = 0
 
         return obj
 
@@ -437,10 +491,11 @@ class PartialTSNEEmbedding(np.ndarray):
         callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
             iterations. Each callback receives an :class:`IterationState`
-            snapshot containing the current iteration, embedding, gradient,
-            error, exaggeration, and degrees-of-freedom values. Returning
-            ``True`` from any callback will interrupt the optimization.
-            The legacy three-argument signature
+            snapshot — see that class for the available fields and the
+            distinction between the per-call ``state.iteration`` counter and
+            the cumulative ``state.embedding.optimization_iters_`` counter.
+            Returning ``True`` from any callback will interrupt the
+            optimization. The legacy three-argument signature
             ``callback(iteration, error, embedding)`` is still accepted but
             emits a ``FutureWarning`` and will be removed in a future release.
 
@@ -471,6 +526,8 @@ class PartialTSNEEmbedding(np.ndarray):
                 optimizer=self.optimizer.copy(),
                 **self.gradient_descent_params,
             )
+            embedding.dof_ = self.dof_
+            embedding.optimization_iters_ = self.optimization_iters_
 
         # If optimization parameters were passed to this funciton, prefer those
         # over the defaults specified in the TSNE object
@@ -580,12 +637,14 @@ class TSNEEmbedding(np.ndarray):
 
     callbacks: Callable[[IterationState], bool]
         Callbacks, which will be run every ``callbacks_every_iters`` iterations.
-        Each callback receives an :class:`IterationState` snapshot containing
-        the current iteration, embedding, gradient, error, exaggeration, and
-        degrees-of-freedom values. Returning ``True`` from any callback will
-        interrupt the optimization. The legacy three-argument signature
-        ``callback(iteration, error, embedding)`` is still accepted but emits a
-        ``FutureWarning`` and will be removed in a future release.
+        Each callback receives an :class:`IterationState` snapshot — see that
+        class for the available fields and the distinction between the
+        per-call ``state.iteration`` counter and the cumulative
+        ``state.embedding.optimization_iters_`` counter. Returning ``True``
+        from any callback will interrupt the optimization. The legacy
+        three-argument signature ``callback(iteration, error, embedding)`` is
+        still accepted but emits a ``FutureWarning`` and will be removed in a
+        future release.
 
     callbacks_every_iters: int
         How many iterations should pass between each time the callbacks are
@@ -600,6 +659,15 @@ class TSNEEmbedding(np.ndarray):
     ----------
     kl_divergence: float
         The KL divergence or error of the embedding.
+
+    dof_: float or None
+        The degrees-of-freedom the embedding was last optimized with. See
+        :class:`IterationState` for details.
+
+    optimization_iters_: int
+        The total number of optimization iterations this embedding has
+        been through, accumulated across consecutive :func:`optimize`
+        calls. See :class:`IterationState` for details.
 
     """
 
@@ -644,10 +712,8 @@ class TSNEEmbedding(np.ndarray):
 
         obj.kl_divergence = None
 
-        # Learned degrees-of-freedom value, populated when `dof="auto"`. Carried
-        # across consecutive `optimize()` calls so the optimizer resumes from
-        # where the previous run left off.
         obj.dof_ = None
+        obj.optimization_iters_ = 0
 
         # Interpolation grid variables
         obj.interp_coeffs = None
@@ -751,10 +817,11 @@ class TSNEEmbedding(np.ndarray):
         callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
             iterations. Each callback receives an :class:`IterationState`
-            snapshot containing the current iteration, embedding, gradient,
-            error, exaggeration, and degrees-of-freedom values. Returning
-            ``True`` from any callback will interrupt the optimization.
-            The legacy three-argument signature
+            snapshot — see that class for the available fields and the
+            distinction between the per-call ``state.iteration`` counter and
+            the cumulative ``state.embedding.optimization_iters_`` counter.
+            Returning ``True`` from any callback will interrupt the
+            optimization. The legacy three-argument signature
             ``callback(iteration, error, embedding)`` is still accepted but
             emits a ``FutureWarning`` and will be removed in a future release.
 
@@ -785,6 +852,8 @@ class TSNEEmbedding(np.ndarray):
                 optimizer=self.optimizer.copy(),
                 **self.gradient_descent_params,
             )
+            embedding.dof_ = self.dof_
+            embedding.optimization_iters_ = self.optimization_iters_
 
         # If optimization parameters were passed to this funciton, prefer those
         # over the defaults specified in the TSNE object
@@ -1089,18 +1158,21 @@ class TSNEEmbedding(np.ndarray):
             self.box_x_lower_bounds,
             self.box_y_lower_bounds,
             self.dof_,
+            self.optimization_iters_,
         )
         return state[0], state[1], new_state
 
     def __setstate__(self, state):
         # state layouts (oldest → newest):
-        #   12 elems: no optimizer, no dof_      (very old pickles)
-        #   13 elems: with optimizer, no dof_    (pre learnable-dof)
-        #   14 elems: with optimizer and dof_    (current)
-        if len(state) >= 14:
-            self.dof_ = state[-1]
-            state = state[:-1]
+        #   12 elems: no optimizer, no dof_, no optimization_iters_
+        #   13 elems: with optimizer, no dof_, no optimization_iters_
+        #   15 elems: with optimizer, dof_, and optimization_iters_  (current)
+        if len(state) >= 15:
+            self.optimization_iters_ = state[-1]
+            self.dof_ = state[-2]
+            state = state[:-2]
         else:
+            self.optimization_iters_ = 0
             self.dof_ = None
 
         self.box_y_lower_bounds = state[-1]
@@ -1889,10 +1961,11 @@ class gradient_descent:
         callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
             iterations. Each callback receives an :class:`IterationState`
-            snapshot containing the current iteration, embedding, gradient,
-            error, exaggeration, and degrees-of-freedom values. Returning
-            ``True`` from any callback will interrupt the optimization.
-            The legacy three-argument signature
+            snapshot — see that class for the available fields and the
+            distinction between the per-call ``state.iteration`` counter and
+            the cumulative ``state.embedding.optimization_iters_`` counter.
+            Returning ``True`` from any callback will interrupt the
+            optimization. The legacy three-argument signature
             ``callback(iteration, error, embedding)`` is still accepted but
             emits a ``FutureWarning`` and will be removed in a future release.
 
@@ -1976,10 +2049,6 @@ class gradient_descent:
         if dof == "auto":
             if "dof" not in self.optimizers:
                 self.optimizers["dof"] = DeltaBarDeltaOptimizer()
-            # Resume from a previously learned value if the embedding has one,
-            # otherwise start from `initial_dof` (or 1.0 by default). This lets
-            # consecutive `optimize()` calls (e.g. early-exag → main) continue
-            # learning rather than resetting on each call.
             if embedding.dof_ is not None:
                 dof_ = embedding.dof_
             elif initial_dof is not None:
@@ -1997,6 +2066,8 @@ class gradient_descent:
                 )
             dof_ = dof
             compute_dof_grad = False
+
+        initial_iter = getattr(embedding, "optimization_iters_", 0) or 0
 
         if dof == "auto" and objective_function is kl_divergence_fft:
             log.warning(
@@ -2050,6 +2121,7 @@ class gradient_descent:
             if should_call_callback:
                 embedding_snapshot = embedding.copy()
                 embedding_snapshot.dof_ = dof_
+                embedding_snapshot.optimization_iters_ = initial_iter + iteration + 1
                 state = IterationState(
                     iteration=iteration + 1,
                     exaggeration=exaggeration,
@@ -2065,6 +2137,8 @@ class gradient_descent:
                     # Make sure to un-exaggerate P so it's not corrupted in future runs
                     if exaggeration != 1:
                         P /= exaggeration
+                    embedding.dof_ = dof_
+                    embedding.optimization_iters_ = initial_iter + iteration + 1
                     raise OptimizationInterrupt(error=error, final_embedding=embedding)
 
             if dof == "auto":
@@ -2117,6 +2191,7 @@ class gradient_descent:
         timer.__exit__()
 
         embedding.dof_ = dof_
+        embedding.optimization_iters_ = initial_iter + n_iter
 
         # Make sure to un-exaggerate P so it's not corrupted in future runs
         if exaggeration != 1:
