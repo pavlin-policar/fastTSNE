@@ -768,18 +768,18 @@ class TestGradientDescentOptimizer(unittest.TestCase):
         embedding = self.tsne.prepare_initial(self.x)
 
         self.assertIsNone(
-            embedding.optimizer.gains, "Optimizer should be initialized with no gains"
+            embedding.optimizer.optimizers["embedding"].gains, "Optimizer should be initialized with no gains"
         )
 
         # Check the switch from no gains to some gains
         embedding1 = embedding.optimize(10)
         self.assertIsNone(
-            embedding.optimizer.gains,
+            embedding.optimizer.optimizers["embedding"].gains,
             "Gains changed on initial optimizer even though we did not do "
             "inplace optimization.",
         )
         self.assertIsNotNone(
-            embedding1.optimizer.gains, "Gains were not properly set in new embedding."
+            embedding1.optimizer.optimizers["embedding"].gains, "Gains were not properly set in new embedding."
         )
         self.assertIsNot(
             embedding.optimizer,
@@ -797,7 +797,7 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             "even we did not do inplace optimization.",
         )
         self.assertFalse(
-            np.allclose(embedding1.optimizer.gains, embedding2.optimizer.gains),
+            np.allclose(embedding1.optimizer.optimizers["embedding"].gains, embedding2.optimizer.optimizers["embedding"].gains),
             "The gains in the new embedding did not change at all from the old "
             "embedding.",
         )
@@ -814,19 +814,19 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             "Embedding and partial embedding optimizers are the same instance.",
         )
         self.assertIsNone(
-            partial.optimizer.gains,
+            partial.optimizer.optimizers["embedding"].gains,
             "Partial embedding was not initialized with no gains",
         )
 
         # Check the switch from no gains to some gains
         partial1 = partial.optimize(10)
         self.assertIsNone(
-            partial.optimizer.gains,
+            partial.optimizer.optimizers["embedding"].gains,
             "Gains on initial optimizer changed even though we did not do "
             "inplace optimization.",
         )
         self.assertIsNotNone(
-            partial1.optimizer.gains,
+            partial1.optimizer.optimizers["embedding"].gains,
             "Gains were not properly set in new partial embedding.",
         )
 
@@ -839,7 +839,7 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             "even we did not do inplace optimization.",
         )
         self.assertFalse(
-            np.allclose(partial1.optimizer.gains, partial2.optimizer.gains),
+            np.allclose(partial1.optimizer.optimizers["embedding"].gains, partial2.optimizer.optimizers["embedding"].gains),
             "The gains in the new embedding did not change at all from the old "
             "embedding.",
         )
@@ -868,30 +868,54 @@ class TestGradientDescentOptimizer(unittest.TestCase):
 
     def test_pickling(self):
         obj = openTSNE.tsne.gradient_descent()
-        obj.gains = np.ones(5)
+        obj.optimizers["embedding"].gains = np.ones(5)
         loaded_obj = pickle.loads(pickle.dumps(obj))
-        np.testing.assert_array_equal(loaded_obj.gains, np.ones(5))
+        np.testing.assert_array_equal(
+            loaded_obj.optimizers["embedding"].gains, np.ones(5)
+        )
+
+    def test_unpickling_legacy_optimizer_state(self):
+        # Pickles produced before the optimizer refactor stored `gains` and
+        # `update` directly on `gradient_descent` (and on the learnable-dof
+        # branch, also `dof_gain`/`dof_update`). Round-trip both shapes
+        # through pickle by setting the legacy attrs on the instance dict
+        # before dumping.
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        legacy_master = openTSNE.tsne.gradient_descent()
+        legacy_master.__dict__ = {"gains": np.ones(5), "update": np.zeros(5)}
+        loaded = pickle.loads(pickle.dumps(legacy_master))
+        self.assertIsInstance(
+            loaded.optimizers["embedding"], DeltaBarDeltaOptimizer
+        )
+        np.testing.assert_array_equal(
+            loaded.optimizers["embedding"].gains, np.ones(5)
+        )
+        np.testing.assert_array_equal(
+            loaded.optimizers["embedding"].update, np.zeros(5)
+        )
+        self.assertNotIn("dof", loaded.optimizers)
 
     def test_gains_is_always_numpy_array(self):
         embedding = self.tsne.prepare_initial(self.x)
-        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
-        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+        self.assertIsInstance(embedding.optimizer.optimizers["embedding"].gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.optimizers["embedding"].gains, openTSNE.TSNEEmbedding)
 
         embedding = embedding.optimize(10)
-        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
-        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+        self.assertIsInstance(embedding.optimizer.optimizers["embedding"].gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.optimizers["embedding"].gains, openTSNE.TSNEEmbedding)
 
         embedding.optimize(10, inplace=True)
-        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
-        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+        self.assertIsInstance(embedding.optimizer.optimizers["embedding"].gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.optimizers["embedding"].gains, openTSNE.TSNEEmbedding)
 
     def test_pickling_via_embedding(self):
         embedding = self.tsne.prepare_initial(self.x)
         # Before optimization
         loaded_embedding = pickle.loads(pickle.dumps(embedding))
         np.testing.assert_equal(
-            embedding.optimizer.gains,
-            loaded_embedding.optimizer.gains,
+            embedding.optimizer.optimizers["embedding"].gains,
+            loaded_embedding.optimizer.optimizers["embedding"].gains,
             "Failed loading without any optimization",
         )
 
@@ -900,8 +924,8 @@ class TestGradientDescentOptimizer(unittest.TestCase):
         # After optimization
         loaded_embedding = pickle.loads(pickle.dumps(embedding))
         np.testing.assert_equal(
-            embedding.optimizer.gains,
-            loaded_embedding.optimizer.gains,
+            embedding.optimizer.optimizers["embedding"].gains,
+            loaded_embedding.optimizer.optimizers["embedding"].gains,
             "Failed loading after optimization (differing gains)",
         )
 
@@ -913,7 +937,7 @@ class TestGradientDescentOptimizer(unittest.TestCase):
         partial = partial.optimize(10, negative_gradient_method="fft", learning_rate=0.1)
 
         self.assertTrue(
-            np.all(partial.optimizer.gains > 0),
+            np.all(partial.optimizer.optimizers["embedding"].gains > 0),
             "Gains of points inside the interpolation grid were zeroed out.",
         )
 
@@ -932,7 +956,7 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             )
             partial = partial.optimize(5, learning_rate=0.1)
 
-            gains = partial.optimizer.gains
+            gains = partial.optimizer.optimizers["embedding"].gains
             np.testing.assert_array_equal(
                 gains[0], 0, "%dd: point at the boundary kept its gains" % n_components
             )

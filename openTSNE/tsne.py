@@ -13,6 +13,11 @@ from sklearn.base import BaseEstimator
 from openTSNE import _tsne, utils
 from openTSNE import initialization as initialization_scheme
 from openTSNE.affinity import Affinities, MultiscaleMixture
+from openTSNE.optimizer import (
+    DeltaBarDeltaOptimizer,
+    clip_gradient_norm,
+    clip_step_norm,
+)
 from openTSNE.quad_tree import QuadTree
 
 EPSILON = np.finfo(np.float64).eps
@@ -1738,18 +1743,29 @@ def kl_divergence_fft(
 
 class gradient_descent:
     def __init__(self):
-        self.gains = None
-        self.update = None
-        self.dof_update = 0.0
-        self.dof_gain = 1.0
+        # One optimizer per learnable parameter. Additional entries (e.g.
+        # "dof") are added lazily in `__call__` as needed.
+        self.optimizers = {"embedding": DeltaBarDeltaOptimizer()}
 
     def copy(self):
         optimizer = self.__class__()
-        if self.gains is not None:
-            optimizer.gains = np.copy(self.gains)
-        if self.update is not None:
-            optimizer.update = np.copy(self.update)
+        optimizer.optimizers = {
+            name: opt.copy() for name, opt in self.optimizers.items()
+        }
         return optimizer
+
+    def __setstate__(self, state):
+        # Backwards compat for pickles produced before the optimizer was
+        # extracted into DeltaBarDeltaOptimizer. Old pickles stored the
+        # embedding state flat on `gradient_descent` as `gains`/`update`.
+        if "optimizers" in state:
+            self.__dict__.update(state)
+            return
+
+        emb = DeltaBarDeltaOptimizer()
+        emb.gains = state.get("gains")
+        emb.update = state.get("update")
+        self.optimizers = {"embedding": emb}
 
     def __call__(
         self,
@@ -1927,11 +1943,6 @@ class gradient_descent:
                 lower_limit = reference_embedding.box_x_lower_bounds[0]
                 upper_limit = reference_embedding.box_x_lower_bounds[-1]
 
-        if self.update is None:
-            self.update = np.zeros_like(embedding).view(np.ndarray)
-        if self.gains is None:
-            self.gains = np.ones_like(embedding).view(np.ndarray)
-
         bh_params = {"theta": theta}
         fft_params = {
             "n_interpolation_points": n_interpolation_points,
@@ -1963,6 +1974,8 @@ class gradient_descent:
             start_time = time()
 
         if dof == "auto":
+            if "dof" not in self.optimizers:
+                self.optimizers["dof"] = DeltaBarDeltaOptimizer()
             # Resume from a previously learned value if the embedding has one,
             # otherwise start from `initial_dof` (or 1.0 by default). This lets
             # consecutive `optimize()` calls (e.g. early-exag → main) continue
@@ -2028,10 +2041,7 @@ class gradient_descent:
             # points overlap with the reference points, leading to large
             # gradients
             if max_grad_norm is not None:
-                norm = np.linalg.norm(gradient, axis=1)
-                coeff = max_grad_norm / (norm + 1e-6)
-                mask = coeff < 1
-                gradient[mask] *= coeff[mask, None]
+                clip_gradient_norm(gradient, max_grad_norm, inplace=True)
 
             # Correct the KL divergence w.r.t. the exaggeration if needed
             if should_eval_error and exaggeration != 1:
@@ -2055,46 +2065,25 @@ class gradient_descent:
                         P /= exaggeration
                     raise OptimizationInterrupt(error=error, final_embedding=embedding)
 
-            # === DOF UPDATE (delta-bar-delta) ===
             if dof == "auto":
-                dof_grad_direction_flipped = np.sign(self.dof_update) != np.sign(
-                    dof_grad
+                # Scale the learning rate by n_samples so dof updates are on
+                # an appropriate scale relative to the per-point embedding
+                # gradient (with default lr="auto", this divides out to ~1).
+                dof_lr = learning_rate / embedding.shape[0]
+                dof_step = self.optimizers["dof"].step(
+                    np.atleast_1d(dof_grad), dof_lr, momentum, min_gain=min_gain,
                 )
-                if dof_grad_direction_flipped:
-                    self.dof_gain += 0.2
-                else:
-                    self.dof_gain = self.dof_gain * 0.8 + min_gain
+                dof_ += float(dof_step[0])
 
-                # Normalize learning rate by n_samples to get appropriate scale for DoF
-                n_samples = embedding.shape[0]
-                dof_lr = (
-                    learning_rate / n_samples
-                )  # <<<< This is just 1 with default settings
-
-                self.dof_update = (
-                    momentum * self.dof_update - dof_lr * self.dof_gain * dof_grad
-                )
-                dof_ += self.dof_update
-            # === END DOF UPDATE ===
-
-            # Update the embedding using the gradient
-            grad_direction_flipped = np.sign(self.update) != np.sign(gradient)
-            grad_direction_same = np.invert(grad_direction_flipped)
-            self.gains[grad_direction_flipped] += 0.2
-            self.gains[grad_direction_same] = (
-                self.gains[grad_direction_same] * 0.8 + min_gain
+            step = self.optimizers["embedding"].step(
+                gradient.view(np.ndarray),
+                learning_rate,
+                momentum,
+                min_gain=min_gain,
             )
-            gradient = gradient.view(np.ndarray)
-            self.update = momentum * self.update - learning_rate * self.gains * gradient
-
-            # Clip the update sizes
             if max_step_norm is not None:
-                update_norms = np.linalg.norm(self.update, axis=1, keepdims=True)
-                mask = update_norms.squeeze() > max_step_norm
-                self.update[mask] /= update_norms[mask]
-                self.update[mask] *= max_step_norm
-
-            embedding += self.update
+                clip_step_norm(step, max_step_norm, inplace=True)
+            embedding += step
 
             # Zero-mean the embedding only if we're not adding new data points,
             # otherwise this will reset point positions
@@ -2113,7 +2102,7 @@ class gradient_descent:
                     )
 
                 # Zero out the momentum terms for the points that hit the boundary
-                self.gains[mask] = 0
+                self.optimizers["embedding"].reset_momentum(mask)
 
             if verbose and (iteration + 1) % 50 == 0:
                 stop_time = time()
