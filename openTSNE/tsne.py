@@ -367,7 +367,7 @@ class PartialTSNEEmbedding(np.ndarray):
 
     Attributes
     ----------
-    kl_divergence: float
+    kl_divergence_: float
         The KL divergence or error of the embedding.
 
     dof_: float or None
@@ -378,6 +378,12 @@ class PartialTSNEEmbedding(np.ndarray):
         The total number of optimization iterations this embedding has
         been through, accumulated across consecutive :func:`optimize`
         calls. See :class:`IterationState` for details.
+
+    Notes
+    -----
+    The attribute ``kl_divergence`` (without trailing underscore) is
+    deprecated and will be removed in a future release. Use
+    ``kl_divergence_`` instead.
 
     """
 
@@ -408,7 +414,7 @@ class PartialTSNEEmbedding(np.ndarray):
             )
         obj.optimizer = optimizer
 
-        obj.kl_divergence = None
+        obj.kl_divergence_ = None
         obj.dof_ = None
         obj.optimization_iters_ = 0
 
@@ -552,9 +558,19 @@ class PartialTSNEEmbedding(np.ndarray):
                 raise ex
             error, embedding = ex.error, ex.final_embedding
 
-        embedding.kl_divergence = error
+        embedding.kl_divergence_ = error
 
         return embedding
+
+    @property
+    def kl_divergence(self):
+        warnings.warn(
+            "The `kl_divergence` attribute is deprecated and will be removed "
+            "in a future release. Use `kl_divergence_` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.kl_divergence_
 
 
 class TSNEEmbedding(np.ndarray):
@@ -657,7 +673,7 @@ class TSNEEmbedding(np.ndarray):
 
     Attributes
     ----------
-    kl_divergence: float
+    kl_divergence_: float
         The KL divergence or error of the embedding.
 
     dof_: float or None
@@ -668,6 +684,12 @@ class TSNEEmbedding(np.ndarray):
         The total number of optimization iterations this embedding has
         been through, accumulated across consecutive :func:`optimize`
         calls. See :class:`IterationState` for details.
+
+    Notes
+    -----
+    The attribute ``kl_divergence`` (without trailing underscore) is
+    deprecated and will be removed in a future release. Use
+    ``kl_divergence_`` instead.
 
     """
 
@@ -710,8 +732,7 @@ class TSNEEmbedding(np.ndarray):
             )
         obj.optimizer = optimizer
 
-        obj.kl_divergence = None
-
+        obj.kl_divergence_ = None
         obj.dof_ = None
         obj.optimization_iters_ = 0
 
@@ -875,7 +896,7 @@ class TSNEEmbedding(np.ndarray):
                 raise ex
             error, embedding = ex.error, ex.final_embedding
 
-        embedding.kl_divergence = error
+        embedding.kl_divergence_ = error
 
         return embedding
 
@@ -1153,7 +1174,7 @@ class TSNEEmbedding(np.ndarray):
             self.affinities,
             self.gradient_descent_params,
             self.random_state,
-            self.kl_divergence,
+            self.kl_divergence_,
             self.interp_coeffs,
             self.box_x_lower_bounds,
             self.box_y_lower_bounds,
@@ -1178,7 +1199,7 @@ class TSNEEmbedding(np.ndarray):
         self.box_y_lower_bounds = state[-1]
         self.box_x_lower_bounds = state[-2]
         self.interp_coeffs = state[-3]
-        self.kl_divergence = state[-4]
+        self.kl_divergence_ = state[-4]
         self.random_state = state[-5]
         self.gradient_descent_params = state[-6]
         self.affinities = state[-7]
@@ -1189,6 +1210,16 @@ class TSNEEmbedding(np.ndarray):
         else:
             self.optimizer = state[-8]
             super().__setstate__(state[:-8])
+
+    @property
+    def kl_divergence(self):
+        warnings.warn(
+            "The `kl_divergence` attribute is deprecated and will be removed "
+            "in a future release. Use `kl_divergence_` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.kl_divergence_
 
 
 class TSNE(BaseEstimator):

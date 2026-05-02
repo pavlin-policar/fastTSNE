@@ -185,8 +185,20 @@ class TestOptimizerReturnShape(unittest.TestCase):
 
     def test_fit_returns_embedding_with_kl(self):
         emb = TSNE_BH(early_exaggeration_iter=5, n_iter=5).fit(self.x)
-        self.assertTrue(hasattr(emb, "kl_divergence"))
-        self.assertTrue(np.isfinite(emb.kl_divergence))
+        self.assertTrue(hasattr(emb, "kl_divergence_"))
+        self.assertTrue(np.isfinite(emb.kl_divergence_))
+
+    def test_kl_divergence_deprecated_alias(self):
+        emb = TSNE_BH(early_exaggeration_iter=5, n_iter=5).fit(self.x)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            value = emb.kl_divergence
+        self.assertTrue(
+            any(issubclass(w.category, DeprecationWarning) for w in caught),
+            "Reading `kl_divergence` should emit a DeprecationWarning.",
+        )
+        self.assertEqual(value, emb.kl_divergence_)
 
 
 class TestDofAutoLearning(unittest.TestCase):
