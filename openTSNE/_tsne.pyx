@@ -212,7 +212,7 @@ cpdef tuple estimate_negative_gradient_bh(
     q_{ij}s.
     """
     cdef:
-        Py_ssize_t i, num_points = embedding.shape[0]
+        Py_ssize_t i, j, num_points = embedding.shape[0]
         double sum_Q = 0.0
         double alpha_grad_neg = 0.0
         double[::1] sum_Qi = np.zeros(num_points, dtype=float)
@@ -232,7 +232,6 @@ cpdef tuple estimate_negative_gradient_bh(
             theta,
             dof,
             &alpha_grad_neg_i[i],
-            embedding.shape[1],
             compute_dof_grad,
         )
 
@@ -263,9 +262,12 @@ cdef void _estimate_negative_gradient_single(
     double theta,
     double dof,
     double *alpha_grad_neg,
-    Py_ssize_t n_dims,
     bint compute_dof_grad,
 ) noexcept nogil:
+    # Make sure that we spend no time on empty nodes or simple self-interactions
+    if node.num_points == 0 or node.is_leaf and is_close(node, point, EPSILON):
+        return
+
     cdef:
         double distance = EPSILON
         double q_ij, qij_term, tmp
@@ -300,7 +302,7 @@ cdef void _estimate_negative_gradient_single(
         else:
             grad_coeff = qij_term * q_ij
 
-        for d in range(n_dims):
+        for d in range(node.n_dims):
             gradient[d] -= grad_coeff * (point[d] - node.center_of_mass[d])
 
         # Compute the negative alpha gradient contribution (only when needed
@@ -322,7 +324,6 @@ cdef void _estimate_negative_gradient_single(
             theta,
             dof,
             alpha_grad_neg,
-            n_dims,
             compute_dof_grad,
         )
 

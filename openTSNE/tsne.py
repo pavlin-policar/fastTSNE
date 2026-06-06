@@ -415,7 +415,11 @@ class PartialTSNEEmbedding(np.ndarray):
         obj.optimizer = optimizer
 
         obj.kl_divergence_ = None
-        obj.dof_ = None
+        # Mirror the parent embedding's behavior: a fixed dof is reflected on
+        # the embedding immediately; `dof="auto"` stays as None until the
+        # optimizer warm-starts.
+        partial_dof = gradient_descent_params.get("dof")
+        obj.dof_ = partial_dof if isinstance(partial_dof, (int, float)) else None
         obj.optimization_iters_ = 0
 
         return obj
@@ -601,9 +605,21 @@ class TSNEEmbedding(np.ndarray):
         The exaggeration factor is used to increase the attractive forces of
         nearby points, producing more compact clusters.
 
-    dof: float
+    dof: Union[float, str]
         Degrees of freedom as described in Kobak et al. "Heavy-tailed kernels
         reveal a finer cluster structure in t-SNE visualisations", 2019.
+        If ``dof="auto"``, the degrees of freedom are learned during
+        optimization (only supported with ``negative_gradient_method="bh"``;
+        the FFT path will warn and keep dof fixed). The optimizer warm-starts
+        from the embedding's current ``dof_`` if set, otherwise from
+        ``initial_dof``, otherwise from 1.0. The latest learned value is
+        written back to ``embedding.dof_``.
+
+    initial_dof: Optional[float]
+        Starting value for the learnable degrees of freedom when
+        ``dof="auto"`` and the embedding has no prior ``dof_`` set. Ignored
+        otherwise (and a warning is emitted if given alongside a fixed
+        ``dof``).
 
     momentum: float
         Momentum accounts for gradient directions from previous iterations,
@@ -733,7 +749,11 @@ class TSNEEmbedding(np.ndarray):
         obj.optimizer = optimizer
 
         obj.kl_divergence_ = None
-        obj.dof_ = None
+        # Reflect the requested dof on the embedding immediately. For fixed
+        # dof, this matches the value the optimizer will use; for `dof="auto"`,
+        # leave it as None so the optimizer can warm-start from
+        # `initial_dof`/1.0 on first run.
+        obj.dof_ = dof if isinstance(dof, (int, float)) else None
         obj.optimization_iters_ = 0
 
         # Interpolation grid variables
@@ -772,9 +792,22 @@ class TSNEEmbedding(np.ndarray):
             The exaggeration factor is used to increase the attractive forces of
             nearby points, producing more compact clusters.
 
-        dof: float
-            Degrees of freedom as described in Kobak et al. "Heavy-tailed kernels
-            reveal a finer cluster structure in t-SNE visualisations", 2019.
+        dof: Union[float, str]
+            Degrees of freedom as described in Kobak et al. "Heavy-tailed
+            kernels reveal a finer cluster structure in t-SNE visualisations",
+            2019. If ``dof="auto"``, the degrees of freedom are learned
+            during optimization (only supported with
+            ``negative_gradient_method="bh"``; the FFT path will warn and keep
+            dof fixed). The optimizer warm-starts from the embedding's current
+            ``dof_`` if set, otherwise from ``initial_dof``, otherwise from
+            1.0. The latest learned value is written back to
+            ``embedding.dof_``.
+
+        initial_dof: Optional[float]
+            Starting value for the learnable degrees of freedom when
+            ``dof="auto"`` and the embedding has no prior ``dof_`` set.
+            Ignored otherwise (and a warning is emitted if given alongside a
+            fixed ``dof``).
 
         momentum: float
             Momentum accounts for gradient directions from previous iterations,
@@ -915,6 +948,8 @@ class TSNEEmbedding(np.ndarray):
         final_momentum=0.8,
         max_grad_norm=0.25,
         max_step_norm=None,
+        dof="inherit",
+        initial_dof=None,
     ):
         """Embed new points into the existing embedding.
 
@@ -992,6 +1027,21 @@ class TSNEEmbedding(np.ndarray):
             clipped. This prevents points from "shooting off" from
             the embedding.
 
+        dof: Union[float, str]
+            Degrees of freedom for the new points. One of:
+
+            - ``"inherit"`` (default): pin dof at the parent embedding's
+              effective dof so the new points live in the same kernel as the
+              reference. Almost always the right choice.
+            - ``"auto"``: learn dof for the new points independently of the
+              parent. Warm-starts from ``initial_dof`` if given, otherwise
+              from the parent's learned dof, otherwise from 1.0.
+            - a float: pin dof at that fixed value.
+
+        initial_dof: Optional[float]
+            Starting value for the learnable dof when ``dof="auto"``. Ignored
+            otherwise.
+
         Returns
         -------
         PartialTSNEEmbedding
@@ -1018,7 +1068,12 @@ class TSNEEmbedding(np.ndarray):
         self -= (np.max(self, axis=0) + np.min(self, axis=0)) / 2
 
         embedding = self.prepare_partial(
-            X, initialization=initialization, k=k, **affinity_params
+            X,
+            initialization=initialization,
+            k=k,
+            dof=dof,
+            initial_dof=initial_dof,
+            **affinity_params,
         )
 
         try:
@@ -1049,7 +1104,15 @@ class TSNEEmbedding(np.ndarray):
 
         return embedding
 
-    def prepare_partial(self, X, initialization="median", k=25, **affinity_params):
+    def prepare_partial(
+        self,
+        X,
+        initialization="median",
+        k=25,
+        dof="inherit",
+        initial_dof=None,
+        **affinity_params,
+    ):
         """Prepare a partial embedding which can be optimized.
 
         Parameters
@@ -1068,6 +1131,22 @@ class TSNEEmbedding(np.ndarray):
             the point onto the embedding. This is different from ``perpelxity``
             because perplexity affects optimization while this only affects the
             initial point positions.
+
+        dof: Union[float, str]
+            Degrees of freedom for the partial embedding. One of:
+
+            - ``"inherit"`` (default): pin dof at the parent embedding's
+              effective dof (``parent.dof_``), so the new points live in the
+              same kernel as the reference. This is almost always what you
+              want.
+            - ``"auto"``: learn dof for the partial embedding independently of
+              the parent. Warm-starts from ``initial_dof`` if given, otherwise
+              from ``parent.dof_`` if available, otherwise from 1.0.
+            - a float: use that fixed dof for the partial embedding.
+
+        initial_dof: Optional[float]
+            Starting value for the learnable dof when ``dof="auto"``. Ignored
+            otherwise.
 
         **affinity_params: dict
             Additional params to be passed to the ``Affinities.to_new`` method.
@@ -1118,12 +1197,72 @@ class TSNEEmbedding(np.ndarray):
         else:
             raise ValueError(f"Unrecognized initialization scheme `{initialization}`.")
 
-        return PartialTSNEEmbedding(
+        gd_params = dict(self.gradient_descent_params)
+        gd_params, warm_start_dof = self._resolve_partial_dof(
+            gd_params, dof, initial_dof
+        )
+
+        partial = PartialTSNEEmbedding(
             embedding,
             self,
             P=P,
-            **self.gradient_descent_params,
+            **gd_params,
         )
+        # For `dof="auto"` with no explicit `initial_dof`, warm-start the
+        # partial's `dof_` so the optimizer continues from the parent's
+        # learned value rather than restarting from 1.0.
+        if warm_start_dof is not None:
+            partial.dof_ = warm_start_dof
+        return partial
+
+    def _resolve_partial_dof(self, gd_params, dof, initial_dof):
+        """Resolve the partial-embedding dof mode.
+
+        Returns a (gd_params, warm_start_dof) pair: ``gd_params`` is the
+        merged param dict to hand to ``PartialTSNEEmbedding``, and
+        ``warm_start_dof`` is an optional float to assign to ``partial.dof_``
+        after construction (used only by the ``dof="auto"`` warm-start path).
+        """
+        warm_start_dof = None
+
+        if dof == "inherit":
+            inherited = self.dof_
+            if inherited is None:
+                # `parent.dof_ is None` only when the parent was constructed
+                # with `dof="auto"` and never optimized — for fixed-dof
+                # parents the constructor mirrors the value into `dof_`. With
+                # nothing learned to inherit, fall back to the parent's
+                # `initial_dof`, then to 1.0 (the optimizer's bootstrap).
+                parent_initial = self.gradient_descent_params.get("initial_dof")
+                inherited = parent_initial if parent_initial is not None else 1.0
+            gd_params["dof"] = float(inherited)
+            gd_params.pop("initial_dof", None)
+            if initial_dof is not None:
+                warnings.warn(
+                    "`initial_dof` is ignored when `dof='inherit'`.",
+                    stacklevel=3,
+                )
+        elif dof == "auto":
+            gd_params["dof"] = "auto"
+            gd_params["initial_dof"] = initial_dof
+            # If the user did not pin `initial_dof` and the parent has a
+            # learned dof, warm-start from it. Explicit `initial_dof` wins.
+            if initial_dof is None and self.dof_ is not None:
+                warm_start_dof = float(self.dof_)
+        elif isinstance(dof, (int, float)) and not isinstance(dof, bool):
+            gd_params["dof"] = float(dof)
+            gd_params.pop("initial_dof", None)
+            if initial_dof is not None:
+                warnings.warn(
+                    "`initial_dof` is ignored when `dof` is a fixed float.",
+                    stacklevel=3,
+                )
+        else:
+            raise ValueError(
+                f"`dof` must be 'inherit', 'auto', or a float; got {dof!r}."
+            )
+
+        return gd_params, warm_start_dof
 
     def prepare_interpolation_grid(self, padding=0.25):
         """Evaluate and save the interpolation grid coefficients.
@@ -1309,9 +1448,20 @@ class TSNE(BaseEstimator):
         This can be used to form more densely packed clusters and is useful
         for large data sets.
 
-    dof: float
+    dof: Union[float, str]
         Degrees of freedom as described in Kobak et al. "Heavy-tailed kernels
-        reveal a finer cluster structure in t-SNE visualisations", 2019.
+        reveal a finer cluster structure in t-SNE visualisations", 2019. If
+        ``dof="auto"``, the degrees of freedom are learned during optimization
+        jointly with the embedding (only supported with
+        ``negative_gradient_method="bh"``; the FFT path will warn and keep dof
+        fixed at ``initial_dof``). The latest learned value is written back to
+        ``embedding.dof_`` and persists across consecutive ``optimize()``
+        calls.
+
+    initial_dof: Optional[float]
+        Starting value for the learnable degrees of freedom when
+        ``dof="auto"``. If unset, learning starts at 1.0. Ignored when
+        ``dof`` is a fixed float (a warning is emitted in that case).
 
     theta: float
         Only used when ``negative_gradient_method="bh"`` or its other aliases.
@@ -1974,12 +2124,18 @@ class gradient_descent:
             The exaggeration factor is used to increase the attractive forces of
             nearby points, producing more compact clusters.
 
-        dof: float
-            Degrees of freedom of the Student's t-distribution.
+        dof: Union[float, str]
+            Degrees of freedom of the Student's t-distribution. If
+            ``dof="auto"``, the degrees of freedom are learned during
+            optimization (only supported with
+            ``negative_gradient_method="bh"``); the optimizer warm-starts from
+            ``embedding.dof_`` if set, otherwise from ``initial_dof``,
+            otherwise from 1.0.
 
-        optimize_for_alpha: bool
-            If True, perform the optimization for the alpha via gradient descent.
-            **Implemented only for the Barnes-Hut objective function.**
+        initial_dof: Optional[float]
+            Starting value for the learnable degrees of freedom when
+            ``dof="auto"``. Ignored otherwise (and a warning is emitted if
+            given alongside a fixed ``dof``).
 
         min_gain: float
             Minimum individual gain for each parameter.

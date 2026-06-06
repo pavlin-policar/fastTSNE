@@ -368,6 +368,35 @@ class TestDofAutoLearning(unittest.TestCase):
         self.assertIsInstance(learned.dof_, float)
         self.assertNotEqual(learned.dof_, 1.0)
 
+    def test_dof_attribute_set_at_construction_for_fixed_dof(self):
+        # A freshly-constructed (un-optimized) embedding must already expose
+        # `dof_` matching its fixed `dof`, so callers don't have to branch on
+        # whether optimization has run yet. For `dof="auto"`, `dof_` stays
+        # None until the optimizer warm-starts.
+        from openTSNE import TSNEEmbedding
+        from openTSNE import affinity, initialization
+
+        aff = affinity.PerplexityBasedNN(self.x, perplexity=15, random_state=42)
+        init = initialization.pca(self.x, random_state=42)
+
+        emb_default = TSNEEmbedding(init, aff, negative_gradient_method="bh")
+        self.assertEqual(emb_default.dof_, 1.0)
+
+        emb_fixed = TSNEEmbedding(
+            init, aff, negative_gradient_method="bh", dof=2.5,
+        )
+        self.assertEqual(emb_fixed.dof_, 2.5)
+
+        emb_auto = TSNEEmbedding(
+            init, aff, negative_gradient_method="bh", dof="auto",
+        )
+        self.assertIsNone(emb_auto.dof_)
+
+        # `prepare_initial` (the path TSNE.fit goes through) must give the
+        # same answer.
+        prepared = TSNE_BH(dof=2.5).prepare_initial(self.x)
+        self.assertEqual(prepared.dof_, 2.5)
+
     def test_auto_dof_resumes_across_optimize_calls(self):
         # The learned dof must persist on the embedding so a subsequent
         # `optimize()` call resumes from the last learned value rather than
@@ -640,6 +669,283 @@ class TestOptimizationItersTracking(unittest.TestCase):
             early_exaggeration_iter=7, n_iter=11,
         ).fit(self.x)
         self.assertEqual(embedding.optimization_iters_, 18)
+
+
+class TestTransformWithLearnedDof(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        x = datasets.load_iris()["data"]
+        rng = np.random.RandomState(0)
+        idx = rng.permutation(len(x))
+        cls.x_train = x[idx[:120]]
+        cls.x_new = x[idx[120:]]
+
+    def test_transform_pins_learned_dof(self):
+        # After fitting a reference embedding with `dof="auto"`, transforming
+        # new points must keep dof fixed at the learned value — the new
+        # points should live in the same kernel as the reference, not relearn
+        # dof from scratch.
+        reference = TSNE_BH(
+            dof="auto", early_exaggeration_iter=5, n_iter=20,
+        ).fit(self.x_train)
+        learned_dof = reference.dof_
+        self.assertIsInstance(learned_dof, float)
+        self.assertNotEqual(learned_dof, 1.0)
+
+        history = []
+
+        def cb(state):
+            history.append(state.dof)
+
+        partial = reference.prepare_partial(self.x_new)
+        # The partial embedding must already reflect the parent's learned dof.
+        self.assertEqual(partial.dof_, learned_dof)
+        # And the gradient_descent_params handed to the optimizer must be
+        # `dof=<float>` rather than `"auto"`, so dof stays fixed.
+        self.assertEqual(partial.gradient_descent_params["dof"], learned_dof)
+
+        partial.optimize(
+            n_iter=5,
+            inplace=True,
+            callbacks=cb,
+            callbacks_every_iters=1,
+        )
+        # All callback snapshots must show the pinned dof.
+        self.assertTrue(history)
+        for d in history:
+            self.assertEqual(d, learned_dof)
+
+    def test_transform_smoke_with_dof_auto(self):
+        # Higher-level smoke test: full transform() call on a `dof="auto"`
+        # fit must run end-to-end and return an embedding whose dof_ matches
+        # the reference.
+        reference = TSNE_BH(
+            dof="auto", early_exaggeration_iter=5, n_iter=20,
+        ).fit(self.x_train)
+
+        new_embedding = reference.transform(self.x_new)
+        self.assertEqual(new_embedding.shape, (self.x_new.shape[0], 2))
+        self.assertEqual(new_embedding.dof_, reference.dof_)
+
+    def test_transform_inherits_fixed_parent_dof(self):
+        # Symmetric case: parent fitted with a fixed non-default dof. The
+        # partial embedding (and the transformed result) must use the same
+        # value — the new points should live in the same kernel.
+        reference = TSNE_BH(
+            dof=5.0, early_exaggeration_iter=5, n_iter=20,
+        ).fit(self.x_train)
+        self.assertEqual(reference.dof_, 5.0)
+
+        partial = reference.prepare_partial(self.x_new)
+        self.assertEqual(partial.dof_, 5.0)
+        self.assertEqual(partial.gradient_descent_params["dof"], 5.0)
+
+        history = []
+        partial.optimize(
+            n_iter=5,
+            inplace=True,
+            callbacks=lambda s: history.append(s.dof),
+            callbacks_every_iters=1,
+        )
+        self.assertTrue(history)
+        for d in history:
+            self.assertEqual(d, 5.0)
+
+        new_embedding = reference.transform(self.x_new)
+        self.assertEqual(new_embedding.dof_, 5.0)
+
+    def test_inherit_falls_back_to_one_when_auto_parent_has_no_learned_dof(self):
+        # Edge case: parent was constructed with `dof="auto"` (no
+        # `initial_dof`) but never optimized, so there is no learned value
+        # to inherit. Default `dof="inherit"` falls back to 1.0 — the same
+        # default the optimizer uses when bootstrapping.
+        from openTSNE import TSNEEmbedding
+        from openTSNE import affinity, initialization
+
+        aff = affinity.PerplexityBasedNN(
+            self.x_train, perplexity=15, random_state=42
+        )
+        init = initialization.pca(self.x_train, random_state=42)
+        reference = TSNEEmbedding(
+            init, aff, negative_gradient_method="bh", dof="auto",
+        )
+        self.assertIsNone(reference.dof_)
+
+        partial = reference.prepare_partial(self.x_new)
+        self.assertEqual(partial.gradient_descent_params["dof"], 1.0)
+        self.assertEqual(partial.dof_, 1.0)
+
+    def test_inherit_uses_initial_dof_when_auto_parent_unoptimized(self):
+        # When the parent was constructed with `dof="auto"` and an explicit
+        # `initial_dof`, but never optimized, `dof="inherit"` should fall
+        # back to that `initial_dof` rather than the optimizer bootstrap of
+        # 1.0 — it is the closest expression of the user's intent.
+        from openTSNE import TSNEEmbedding
+        from openTSNE import affinity, initialization
+
+        aff = affinity.PerplexityBasedNN(
+            self.x_train, perplexity=15, random_state=42
+        )
+        init = initialization.pca(self.x_train, random_state=42)
+        reference = TSNEEmbedding(
+            init, aff, negative_gradient_method="bh",
+            dof="auto", initial_dof=3.5,
+        )
+        self.assertIsNone(reference.dof_)
+        self.assertEqual(
+            reference.gradient_descent_params.get("initial_dof"), 3.5
+        )
+
+        partial = reference.prepare_partial(self.x_new)
+        self.assertEqual(partial.gradient_descent_params["dof"], 3.5)
+        self.assertEqual(partial.dof_, 3.5)
+
+
+class TestPartialDofModes(unittest.TestCase):
+    """Three-mode dof API on prepare_partial / transform."""
+
+    @classmethod
+    def setUpClass(cls):
+        x = datasets.load_iris()["data"]
+        rng = np.random.RandomState(0)
+        idx = rng.permutation(len(x))
+        cls.x_train = x[idx[:120]]
+        cls.x_new = x[idx[120:]]
+
+        # A reference embedding fitted with `dof="auto"`. Every test that
+        # needs a learned dof reuses this so we only pay the optimization
+        # cost once.
+        cls.auto_reference = TSNE_BH(
+            dof="auto", early_exaggeration_iter=5, n_iter=20,
+        ).fit(cls.x_train)
+        cls.learned_dof = cls.auto_reference.dof_
+        assert isinstance(cls.learned_dof, float)
+        assert cls.learned_dof != 1.0
+
+        cls.fixed_reference = TSNE_BH(
+            dof=5.0, early_exaggeration_iter=5, n_iter=20,
+        ).fit(cls.x_train)
+
+    def _dof_history(self, partial):
+        history = []
+        partial.optimize(
+            n_iter=5,
+            inplace=True,
+            callbacks=lambda s: history.append(s.dof),
+            callbacks_every_iters=1,
+        )
+        return history
+
+    # --- inherit (default) -------------------------------------------------
+
+    def test_inherit_from_auto_parent(self):
+        partial = self.auto_reference.prepare_partial(self.x_new)
+        self.assertEqual(partial.dof_, self.learned_dof)
+        self.assertEqual(
+            partial.gradient_descent_params["dof"], self.learned_dof
+        )
+        history = self._dof_history(partial)
+        self.assertTrue(history)
+        for d in history:
+            self.assertEqual(d, self.learned_dof)
+
+    def test_inherit_from_fixed_parent(self):
+        partial = self.fixed_reference.prepare_partial(self.x_new)
+        self.assertEqual(partial.dof_, 5.0)
+        self.assertEqual(partial.gradient_descent_params["dof"], 5.0)
+        for d in self._dof_history(partial):
+            self.assertEqual(d, 5.0)
+
+    def test_inherit_warns_when_initial_dof_passed(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.auto_reference.prepare_partial(self.x_new, initial_dof=2.0)
+        self.assertTrue(
+            any("initial_dof" in str(w.message) for w in caught),
+            f"Expected initial_dof warning, got {[str(w.message) for w in caught]}",
+        )
+
+    # --- auto: learn a fresh dof for the partial --------------------------
+
+    def test_auto_warm_starts_from_parent_learned_dof(self):
+        # Without `initial_dof`, the partial warm-starts from the parent's
+        # learned value but is allowed to move from there.
+        partial = self.auto_reference.prepare_partial(self.x_new, dof="auto")
+        self.assertEqual(partial.gradient_descent_params["dof"], "auto")
+        self.assertEqual(partial.dof_, self.learned_dof)
+
+        history = self._dof_history(partial)
+        self.assertEqual(history[0], self.learned_dof)
+        # With enough iterations dof should actually move; for a tight test
+        # just confirm the final value is a float and that learning ran
+        # without error.
+        self.assertIsInstance(history[-1], float)
+
+    def test_auto_with_initial_dof_overrides_warm_start(self):
+        partial = self.auto_reference.prepare_partial(
+            self.x_new, dof="auto", initial_dof=2.0,
+        )
+        self.assertEqual(partial.gradient_descent_params["dof"], "auto")
+        self.assertEqual(partial.gradient_descent_params["initial_dof"], 2.0)
+        # Explicit initial_dof wins: partial.dof_ stays None so the optimizer
+        # falls through to initial_dof=2.0.
+        self.assertIsNone(partial.dof_)
+
+        history = self._dof_history(partial)
+        self.assertEqual(history[0], 2.0)
+
+    def test_auto_from_fixed_parent_warm_starts_from_fixed_value(self):
+        partial = self.fixed_reference.prepare_partial(self.x_new, dof="auto")
+        self.assertEqual(partial.dof_, 5.0)
+        history = self._dof_history(partial)
+        self.assertEqual(history[0], 5.0)
+
+    # --- fixed float ------------------------------------------------------
+
+    def test_fixed_float_dof(self):
+        partial = self.auto_reference.prepare_partial(self.x_new, dof=3.0)
+        self.assertEqual(partial.gradient_descent_params["dof"], 3.0)
+        self.assertEqual(partial.dof_, 3.0)
+        for d in self._dof_history(partial):
+            self.assertEqual(d, 3.0)
+
+    def test_fixed_float_warns_when_initial_dof_passed(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.auto_reference.prepare_partial(
+                self.x_new, dof=3.0, initial_dof=2.0,
+            )
+        self.assertTrue(
+            any("initial_dof" in str(w.message) for w in caught),
+            f"Expected initial_dof warning, got {[str(w.message) for w in caught]}",
+        )
+
+    # --- validation -------------------------------------------------------
+
+    def test_unknown_dof_string_raises(self):
+        with self.assertRaisesRegex(ValueError, "dof"):
+            self.auto_reference.prepare_partial(self.x_new, dof="nonsense")
+
+    # --- transform() threading --------------------------------------------
+
+    def test_transform_default_inherit(self):
+        new_embedding = self.auto_reference.transform(self.x_new)
+        self.assertEqual(new_embedding.dof_, self.learned_dof)
+
+    def test_transform_auto_relearns(self):
+        new_embedding = self.auto_reference.transform(
+            self.x_new, dof="auto", n_iter=20,
+        )
+        # The transformed embedding's `dof_` should be a float, but it can
+        # have moved away from the parent's learned value because the
+        # optimizer was free to relearn.
+        self.assertIsInstance(new_embedding.dof_, float)
+
+    def test_transform_fixed_float(self):
+        new_embedding = self.auto_reference.transform(
+            self.x_new, dof=3.0, n_iter=10,
+        )
+        self.assertEqual(new_embedding.dof_, 3.0)
 
 
 if __name__ == "__main__":
