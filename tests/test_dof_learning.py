@@ -881,6 +881,40 @@ class TestPartialDofModes(unittest.TestCase):
         # without error.
         self.assertIsInstance(history[-1], float)
 
+    def test_auto_dof_stays_positive_over_long_run(self):
+        # Regression: the partial (transform) objective row-normalizes each new
+        # point's q_{ij}s by that point's own sum, so the dof gradient's
+        # negative term must use the same per-point normalization. A previous
+        # bug normalized it by the global sum_Q instead, leaving it ~N times too
+        # small; the positive term then dominated and drove dof to large
+        # negative values (internally clamped, but reported as nonsense). Over a
+        # realistic number of iterations the learned partial dof must stay
+        # positive and finite.
+        partial = self.auto_reference.prepare_partial(self.x_new, dof="auto")
+        history = []
+        partial.optimize(
+            n_iter=250,
+            inplace=True,
+            callbacks=lambda s: history.append(s.dof),
+            callbacks_every_iters=10,
+        )
+        self.assertTrue(history)
+        for d in history:
+            self.assertGreater(d, 0.0)
+            self.assertTrue(np.isfinite(d))
+
+    def test_auto_warns_uncharted_territory(self):
+        # `dof="auto"` against a fixed reference is weakly identified and must
+        # warn the user that they are off the beaten path.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.auto_reference.prepare_partial(self.x_new, dof="auto")
+        self.assertTrue(
+            any("uncharted territory" in str(w.message) for w in caught),
+            f"Expected uncharted-territory warning, got "
+            f"{[str(w.message) for w in caught]}",
+        )
+
     def test_auto_with_initial_dof_overrides_warm_start(self):
         partial = self.auto_reference.prepare_partial(
             self.x_new, dof="auto", initial_dof=2.0,

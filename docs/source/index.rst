@@ -19,6 +19,7 @@ openTSNE is a modular Python implementation of t-Distributed Stochasitc Neighbor
     tsne_algorithm
     parameters
     affinities
+    degrees_of_freedom
     benchmarks
 
 

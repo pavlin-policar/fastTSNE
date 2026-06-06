@@ -1035,7 +1035,13 @@ class TSNEEmbedding(np.ndarray):
               reference. Almost always the right choice.
             - ``"auto"``: learn dof for the new points independently of the
               parent. Warm-starts from ``initial_dof`` if given, otherwise
-              from the parent's learned dof, otherwise from 1.0.
+              from the parent's learned dof, otherwise from 1.0. This is
+              uncharted territory and should be used at your own risk: against a
+              fixed reference the objective has no interior optimum in dof (it
+              decreases monotonically, with sharply diminishing returns, as dof
+              grows), so the learned value drifts upward with more iterations
+              rather than settling, and a warning is emitted. ``"inherit"`` (the
+              default) is recommended.
             - a float: pin dof at that fixed value.
 
         initial_dof: Optional[float]
@@ -1141,7 +1147,12 @@ class TSNEEmbedding(np.ndarray):
               want.
             - ``"auto"``: learn dof for the partial embedding independently of
               the parent. Warm-starts from ``initial_dof`` if given, otherwise
-              from ``parent.dof_`` if available, otherwise from 1.0.
+              from ``parent.dof_`` if available, otherwise from 1.0. Note that
+              dof is only weakly identified here: with the reference fixed, the
+              objective decreases monotonically (with sharply diminishing
+              returns) as dof grows, so the learned value drifts upward with
+              more iterations rather than settling. ``"inherit"`` is preferred
+              unless you specifically want the new points to relearn dof.
             - a float: use that fixed dof for the partial embedding.
 
         initial_dof: Optional[float]
@@ -1243,6 +1254,15 @@ class TSNEEmbedding(np.ndarray):
                     stacklevel=3,
                 )
         elif dof == "auto":
+            warnings.warn(
+                "Learning dof for new points (`dof='auto'` on transform / "
+                "prepare_partial) is uncharted territory: against a fixed "
+                "reference embedding the objective has no interior optimum in "
+                "dof, so the learned value drifts upward with more iterations "
+                "rather than settling. Use at your own risk; `dof='inherit'` "
+                "(the default) is recommended.",
+                stacklevel=3,
+            )
             gd_params["dof"] = "auto"
             gd_params["initial_dof"] = initial_dof
             # If the user did not pin `initial_dof` and the parent has a

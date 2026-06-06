@@ -235,11 +235,9 @@ cpdef tuple estimate_negative_gradient_bh(
             compute_dof_grad,
         )
 
-    # Aggregate sum_Q (and alpha_grad_neg, when requested) from all points
+    # Aggregate sum_Q from all points
     for i in range(num_points):
         sum_Q += sum_Qi[i]
-        if compute_dof_grad:
-            alpha_grad_neg += alpha_grad_neg_i[i]
 
     # Normalize q_{ij}s
     for i in range(gradient.shape[0]):
@@ -249,8 +247,19 @@ cpdef tuple estimate_negative_gradient_bh(
             else:
                 gradient[i, j] /= sum_Qi[i] + EPSILON
 
+    # The negative dof-gradient term must use the same normalization as the
+    # q_{ij}s above: a single global sum_Q for a self-embedding, but each
+    # point's own row sum when embedding against a fixed reference. Using the
+    # global sum_Q in the reference case leaves this term ~N times too small,
+    # so it cannot balance the (row-normalized) positive term and dof diverges.
     if compute_dof_grad:
-        alpha_grad_neg /= sum_Q
+        if pairwise_normalization:
+            for i in range(num_points):
+                alpha_grad_neg += alpha_grad_neg_i[i]
+            alpha_grad_neg /= sum_Q + EPSILON
+        else:
+            for i in range(num_points):
+                alpha_grad_neg += alpha_grad_neg_i[i] / (sum_Qi[i] + EPSILON)
     return sum_Q, alpha_grad_neg
 
 

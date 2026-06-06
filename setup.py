@@ -15,11 +15,65 @@ from Cython.Distutils.build_ext import new_build_ext as build_ext
 from setuptools import setup, Extension
 
 
+def optimize_png_bytes(data, colors=256):
+    """Palette-quantize a PNG (given as bytes) for the web.
+
+    Matplotlib renders scatter plots as high-entropy RGBA PNGs that compress
+    poorly; quantizing them to a 256-colour palette is visually
+    indistinguishable but roughly 4x smaller. Falls back to the original bytes
+    if Pillow is unavailable or the image cannot be processed, so the
+    documentation build never fails just because images could not be shrunk.
+    """
+    import io
+
+    try:
+        from PIL import Image
+    except ImportError:
+        warnings.warn(
+            "Pillow is not installed; documentation PNGs will not be "
+            "optimized. Install it (`pip install pillow`) to shrink them.",
+        )
+        return data
+
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            quantized = im.convert("RGB").quantize(
+                colors=colors,
+                method=Image.Quantize.FASTOCTREE,
+                dither=Image.Dither.NONE,
+            )
+        buffer = io.BytesIO()
+        quantized.save(buffer, "PNG", optimize=True)
+        return buffer.getvalue()
+    except Exception as e:  # pragma: no cover - defensive
+        warnings.warn(f"Could not optimize a PNG ({e}); keeping the original.")
+        return data
+
+
 class ConvertNotebooksToDocs(distutils.cmd.Command):
     description = "Convert the example notebooks to reStructuredText that will" \
                   "be available in the documentation."
 
     user_options = []
+
+    # Notebooks rendered as standalone example pages in the documentation.
+    example_notebooks = [
+        join("examples", "01_simple_usage.ipynb"),
+        join("examples", "02_advanced_usage.ipynb"),
+        join("examples", "03_preserving_global_structure.ipynb"),
+        join("examples", "04_large_data_sets.ipynb"),
+    ]
+    # Notebooks that supply figures for a hand-written User Guide page rather
+    # than becoming a standalone example page. The guide (e.g.
+    # degrees_of_freedom.rst) is authored in rst because it relies on Sphinx
+    # features that do not survive a markdown->rst conversion -- admonitions,
+    # `:meth:`/`:attr:` cross-references, ref labels -- and is mostly conceptual
+    # prose with illustrative (non-runnable) snippets. The notebook contributes
+    # only the runnable worked example, so we keep its rendered images and
+    # discard the generated .rst.
+    figure_only_notebooks = [
+        join("examples", "07_degrees_of_freedom.ipynb"),
+    ]
 
     def initialize_options(self):
         pass
@@ -29,26 +83,31 @@ class ConvertNotebooksToDocs(distutils.cmd.Command):
 
     def run(self):
         import nbconvert
-        from os.path import join
 
         exporter = nbconvert.RSTExporter()
         writer = nbconvert.writers.FilesWriter()
-
-        files = [
-            join("examples", "01_simple_usage.ipynb"),
-            join("examples", "02_advanced_usage.ipynb"),
-            join("examples", "03_preserving_global_structure.ipynb"),
-            join("examples", "04_large_data_sets.ipynb"),
-        ]
         target_dir = join("docs", "source", "examples")
 
-        for fname in files:
+        for fname in self.example_notebooks + self.figure_only_notebooks:
             self.announce(f"Converting {fname}...")
-            directory, nb_name = fname.split("/")
-            nb_name, _ = nb_name.split(".")
+            nb_name = os.path.splitext(os.path.basename(fname))[0]
             body, resources = exporter.from_file(fname)
+
+            # Optimize every rendered PNG for the web (see optimize_png_bytes).
+            outputs = resources.get("outputs", {})
+            for out_name, out_data in list(outputs.items()):
+                if out_name.lower().endswith(".png"):
+                    outputs[out_name] = optimize_png_bytes(out_data)
+
             writer.build_directory = join(target_dir, nb_name)
             writer.write(body, resources, nb_name)
+
+            if fname in self.figure_only_notebooks:
+                # Drop the generated rst; the figures are referenced from the
+                # hand-written guide page instead.
+                rst_path = join(writer.build_directory, nb_name + ".rst")
+                if os.path.exists(rst_path):
+                    os.remove(rst_path)
 
 
 def get_numpy_include():
