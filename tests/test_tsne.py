@@ -1054,7 +1054,9 @@ class TestPrecomputedDistanceMatrices(unittest.TestCase):
             n_iter=0, 
             random_state=42,
         ).fit(affinities=aff)
-        np.testing.assert_array_equal(embedding, desired_init)
+        # See note in `test_pca_init_with_only_affinities_passed`: the spectral
+        # init is recomputed inside `fit`, so compare with a tolerance.
+        np.testing.assert_allclose(embedding, desired_init, rtol=1e-5, atol=1e-10)
 
     def test_precomputed_dist_matrix_via_tsne_interface_uses_spectral_init(self):
         x = np.random.normal(0, 1, (200, 5))
@@ -1068,7 +1070,9 @@ class TestPrecomputedDistanceMatrices(unittest.TestCase):
             n_iter=0,
             random_state=42,
          ).fit(d)
-        np.testing.assert_array_equal(embedding, desired_init)
+        # See note in `test_pca_init_with_only_affinities_passed`: the spectral
+        # init is recomputed inside `fit`, so compare with a tolerance.
+        np.testing.assert_allclose(embedding, desired_init, rtol=1e-5, atol=1e-10)
 
     def test_precomputed_dist_matrix_doesnt_override_valid_inits(self):
         iris = datasets.load_iris()
