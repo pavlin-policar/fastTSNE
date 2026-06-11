@@ -343,6 +343,38 @@ reference it tends to a larger value here (around ``19``), while a fixed
 .. image:: examples/07_degrees_of_freedom/output_28_0.png
    :align: center
 
+A better initialization
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Everything above used the default ``initialization="pca"``. For the Swiss roll
+this is a poor starting point: PCA simply projects the three-dimensional spiral
+onto its plane of greatest variance, so the embedding *begins* already rolled
+up, with layers of the sheet stacked on top of one another. t-SNE's local
+objective rarely undoes a global fold like this, which is why the learned
+embeddings above keep distant parts of the colour gradient (blue and red)
+folded back against each other rather than laid out in a clean rectangle.
+
+Spectral initialization instead places points using the leading eigenvectors of
+the KNN graph, which follow the manifold rather than the ambient geometry. The
+embedding therefore *starts* unrolled, and optimization only has to refine it:
+
+.. code-block:: python
+
+    spectral = TSNE(initialization="spectral", dof="auto", random_state=0).fit(x)
+    spectral.dof_   # ~30
+
+Starting from the unrolled spectral layout, the sheet now stays unrolled: the
+colour gradient runs smoothly from one end to the other across a single
+continuous band, without folding back on itself the way the PCA-initialized
+result does. The optimizer also drives ``dof`` up to a much larger, almost
+Gaussian value here — light tails that hold the connected manifold together
+rather than tearing it apart. For a manifold like the Swiss roll a good
+initialization matters at least as much as the kernel, and spectral
+initialization is the better choice.
+
+.. image:: examples/07_degrees_of_freedom/output_33_0.png
+   :align: center
+
 References
 ----------
 
