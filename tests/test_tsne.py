@@ -966,6 +966,54 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             )
 
 
+class TestDeltaBarDeltaOptimizer(unittest.TestCase):
+    def test_defaults_match_historical_constants(self):
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        opt = DeltaBarDeltaOptimizer()
+        self.assertEqual(opt.gain_increase, 0.2)
+        self.assertEqual(opt.gain_decay, 0.8)
+        self.assertEqual(opt.max_gain, np.inf)
+
+    def test_gain_runs_away_on_monotone_gradient_when_uncapped(self):
+        # A constant-sign gradient makes every step a consistent descent, so the
+        # uncapped gain grows ~ 1 + gain_increase * iters.
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        opt = DeltaBarDeltaOptimizer()
+        for _ in range(100):
+            opt.step(np.array([1.0]), learning_rate=0.01, momentum=0.0)
+        self.assertGreater(opt.gains[0], 15.0)
+
+    def test_max_gain_caps_runaway(self):
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        opt = DeltaBarDeltaOptimizer(max_gain=1.0)
+        for _ in range(100):
+            opt.step(np.array([1.0]), learning_rate=0.01, momentum=0.0)
+        self.assertLessEqual(opt.gains[0], 1.0)
+
+    def test_dof_optimizer_is_gain_capped(self):
+        # The dof optimizer must be created with a capped gain so the scalar dof
+        # cannot run away.
+        tsne = openTSNE.TSNE(
+            neighbors="exact", negative_gradient_method="bh",
+            dof="auto", random_state=42, n_iter=10, early_exaggeration_iter=10,
+        )
+        emb = tsne.fit(datasets.load_iris()["data"])
+        self.assertEqual(emb.optimizer.optimizers["dof"].max_gain, 1.0)
+
+    def test_setstate_supplies_missing_gain_params(self):
+        # Pickles from before the gain params were stored must still load.
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        opt = DeltaBarDeltaOptimizer()
+        opt.__setstate__({"gains": np.ones(3), "update": np.zeros(3)})
+        self.assertEqual(opt.gain_increase, 0.2)
+        self.assertEqual(opt.gain_decay, 0.8)
+        self.assertEqual(opt.max_gain, np.inf)
+
+
 class TestAffinityIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

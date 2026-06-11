@@ -217,10 +217,10 @@ The four behaviours can be summarized as follows.
    * - a number
      - Hold the degrees of freedom fixed at that number.
 
-A worked example: the swiss roll
+A worked example: the Swiss roll
 --------------------------------
 
-The effect of the degrees of freedom is easiest to see on the *swiss roll*: a
+The effect of the degrees of freedom is easiest to see on the *Swiss roll*: a
 two-dimensional sheet rolled up in three dimensions. Because it is a single
 continuous manifold rather than a set of clusters, it makes a good test of how
 the tail heaviness reshapes an embedding. We colour each point by its position
@@ -241,7 +241,7 @@ A heavier-tailed kernel (small ``dof``) pulls neighbouring points apart. On
 clustered data this helps to separate clusters, but on a continuous manifold it
 tears the sheet into fragments. A lighter-tailed kernel keeps it together, and
 letting openTSNE choose with ``dof="auto"`` recovers a fairly large value here —
-around ``5`` — reflecting that the swiss roll should stay connected:
+around ``5`` — reflecting that the Swiss roll should stay connected:
 
 .. code-block:: python
 

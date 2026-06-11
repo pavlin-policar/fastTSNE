@@ -221,6 +221,12 @@ class TestDofAutoLearning(unittest.TestCase):
         self.assertGreater(len(dofs), 0)
         self.assertNotEqual(dofs[0], dofs[-1])
 
+    def test_auto_dof_reaches_lower_kl_than_fixed_dof(self):
+        # `dof="auto"` should always achieve lower KL than `dof=1`
+        fixed = TSNE_BH(dof=1.0, n_iter=100).fit(self.x)
+        auto = TSNE_BH(dof="auto", initial_dof=1.0, n_iter=100).fit(self.x)
+        self.assertLess(auto.kl_divergence_, fixed.kl_divergence_)
+
     def test_default_dof_no_initial_dof(self):
         # Path 1: dof=1 (default), initial_dof=None. Dof should stay at 1
         # throughout, no warnings about initial_dof.
@@ -441,6 +447,51 @@ class TestDofAutoLearning(unittest.TestCase):
             f"Expected dof-auto warning, got: {cm.output}",
         )
         self.assertTrue(all(s.dof == 1.0 for s in history))
+
+
+class TestDofLearningStability(unittest.TestCase):
+    """The learnable dof is optimized in log space with an
+    exaggeration-normalized gradient and a gain-capped optimizer, so it stays
+    positive and well-behaved across exaggeration schedules (see the
+    degrees-of-freedom guide)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.x = datasets.load_iris()["data"]
+
+    def test_dof_stays_positive_in_log_space(self):
+        # Log-space learning can never produce a non-positive dof, even with a
+        # tiny initial value and many iterations.
+        history = []
+        TSNE_BH(
+            dof="auto",
+            initial_dof=0.05,
+            n_iter=100,
+            callbacks=history.append,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        self.assertTrue(all(s.dof > 0 for s in history))
+
+    def test_dof_does_not_diverge_under_strong_early_exaggeration(self):
+        # The old exaggeration coupling sent dof to hundreds/thousands at high
+        # early_exaggeration. With the normalized gradient it must stay sane.
+        learned = {}
+        for ee in (4, 12, 32):
+            emb = TSNE_BH(dof="auto", early_exaggeration=ee, n_iter=250).fit(self.x)
+            learned[ee] = emb.dof_
+            self.assertLess(emb.dof_, 20.0, f"dof diverged at ee={ee}: {emb.dof_}")
+            self.assertGreater(emb.dof_, 0.1)
+        # And the final value should be reasonably consistent across schedules.
+        vals = np.array(list(learned.values()))
+        self.assertLess(vals.std() / vals.mean(), 0.4)
+
+    def test_dof_lr_is_n_independent(self):
+        # The same dof_lr should give comparable learned dof regardless of the
+        # subsample size (the optimum can differ, but learning must not blow up).
+        for n in (75, 150):
+            x = np.repeat(self.x, n // len(self.x) + 1, axis=0)[:n]
+            emb = TSNE_BH(dof="auto", n_iter=100).fit(x)
+            self.assertTrue(0.1 < emb.dof_ < 20.0)
 
 
 class TestIterationStateCallback(unittest.TestCase):

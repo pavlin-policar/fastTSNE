@@ -2094,6 +2094,7 @@ class gradient_descent:
         exaggeration=None,
         dof=1,
         initial_dof=None,
+        dof_lr=0.1,
         min_gain=0.01,
         max_grad_norm=None,
         max_step_norm=5,
@@ -2156,6 +2157,14 @@ class gradient_descent:
             Starting value for the learnable degrees of freedom when
             ``dof="auto"``. Ignored otherwise (and a warning is emitted if
             given alongside a fixed ``dof``).
+
+        dof_lr: float
+            Base learning rate for the learnable degrees of freedom when
+            ``dof="auto"``. dof is learned in log space, and the update is
+            applied with an effective rate of ``dof_lr / exaggeration`` -- the
+            same ``1/exaggeration`` factor the embedding's ``N / exaggeration``
+            rate uses, which cancels the exaggeration-induced inflation of the
+            dof gradient.
 
         min_gain: float
             Minimum individual gain for each parameter.
@@ -2298,7 +2307,9 @@ class gradient_descent:
 
         if dof == "auto":
             if "dof" not in self.optimizers:
-                self.optimizers["dof"] = DeltaBarDeltaOptimizer()
+                # Cap the gain at 1 to prevent runaway, unrecoverable dof during
+                # exaggerated phases of the optimization
+                self.optimizers["dof"] = DeltaBarDeltaOptimizer(max_gain=1)
             if embedding.dof_ is not None:
                 dof_ = embedding.dof_
             elif initial_dof is not None:
@@ -2392,14 +2403,21 @@ class gradient_descent:
                     raise OptimizationInterrupt(error=error, final_embedding=embedding)
 
             if dof == "auto":
-                # Scale the learning rate by n_samples so dof updates are on
-                # an appropriate scale relative to the per-point embedding
-                # gradient (with default lr="auto", this divides out to ~1).
-                dof_lr = learning_rate / embedding.shape[0]
-                dof_step = self.optimizers["dof"].step(
-                    np.atleast_1d(dof_grad), dof_lr, momentum, min_gain=min_gain,
-                )
-                dof_ += float(dof_step[0])
+                # Take one gradient-descent step on log_dof = log(dof), then map
+                # back. Log space keeps dof > 0 with no clamps and makes the update
+                # multiplicative/scale-free. The rate carries the same
+                # 1/exaggeration factor as the embedding's N/exaggeration, which
+                # cancels the exaggeration-induced inflation of the gradient's
+                # attractive term.
+                dof_learning_rate = dof_lr / exaggeration
+                log_dof = np.log(dof_)
+                # Chain rule: dC/d(log_dof) = dC/d(dof) * dof = dof_grad * dof.
+                log_dof_grad = np.atleast_1d(dof_grad * dof_)
+                log_dof_step = self.optimizers["dof"].step(
+                    log_dof_grad, dof_learning_rate, momentum, min_gain=min_gain,
+                )[0]
+                log_dof += float(log_dof_step)
+                dof_ = float(np.exp(log_dof))
 
             step = self.optimizers["embedding"].step(
                 gradient.view(np.ndarray),
