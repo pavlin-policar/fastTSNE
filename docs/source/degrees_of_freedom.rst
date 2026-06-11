@@ -332,7 +332,9 @@ continuing its colour gradient. The other modes behave as described above:
 ``dof="auto"`` relearns a value for the new points, and a number pins them to a
 fixed value. Because ``"auto"`` is only weakly identified against a fixed
 reference it tends to a larger value here (around ``19``), while a fixed
-``dof=1`` deliberately uses a heavier-tailed kernel than the reference.
+``dof=1`` deliberately uses a heavier-tailed kernel than the reference. In all
+three cases the embedding itself is barely affected — the choice of ``dof`` for
+new points changes the learned value far more than where the points land.
 
 .. code-block:: python
 
