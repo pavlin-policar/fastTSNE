@@ -28,15 +28,15 @@ cimport openTSNE._matrix_mul.matrix_mul
 cdef object _local = threading.local()
 
 
-cdef _get_buffer(key, shape):
+cdef _get_buffer(key, shape, dtype=float):
     """A zeroed buffer of the given shape, reused across calls in this thread."""
     cdef object buffers = getattr(_local, "buffers", None)
     cdef object buf
     if buffers is None:
         buffers = _local.buffers = {}
     buf = buffers.get(key)
-    if buf is None or buf.shape != shape:
-        buf = np.zeros(shape, dtype=float)
+    if buf is None or buf.shape != shape or buf.dtype != np.dtype(dtype):
+        buf = np.zeros(shape, dtype=dtype)
         buffers.clear()
         buffers[key] = buf
     return buf
@@ -84,14 +84,13 @@ cdef void matrix_multiply_fft_1d(
         np.asarray(kernel_tilde), workers=num_threads
     )
 
-    # Only the leading half is ever written, so the zeroed tail of a reused
-    # buffer stays zeroed
-    fft_in_buffer = _get_buffer(("1d", n_fft_coeffs), (n_fft_coeffs,))
-
     for d in range(n_terms):
-        fft_in_buffer[:n_interpolation_points_1d] = w[:, d]
-
-        fft_w_coeffs = scipy.fft.rfft(fft_in_buffer, workers=num_threads)
+        # The coefficients occupy the leading half of the circulant embedding;
+        # asking for a longer transform zero-pads the rest, so no padded input
+        # buffer is needed
+        fft_w_coeffs = scipy.fft.rfft(
+            w[:, d], n=n_fft_coeffs, workers=num_threads
+        )
         fft_w_coeffs *= fft_kernel_tilde
         fft_out_buffer = scipy.fft.irfft(
             fft_w_coeffs, n=n_fft_coeffs, workers=num_threads
@@ -142,22 +141,43 @@ cdef void matrix_multiply_fft_2d(
         np.asarray(kernel_tilde), workers=num_threads
     )
 
-    # Only the top left quadrant is ever written, so the zeroed remainder of a
-    # reused buffer stays zeroed
-    fft_in_buffer = _get_buffer(
-        ("2d", n_fft_coeffs), (n_fft_coeffs, n_fft_coeffs)
+    # A two-dimensional transform is a pass along the rows followed by a pass
+    # along the columns, and taking the two passes separately lets both of them
+    # skip work that a single `rfft2`/`irfft2` cannot know about:
+    #
+    #   - the coefficients occupy only the top left quadrant of the circulant
+    #     embedding, so the forward row pass has half its rows zero;
+    #   - only the bottom right quadrant of the result is ever read, so the
+    #     inverse row pass is needed for half the rows.
+    #
+    # Together that removes about a quarter of the transform work. The column
+    # spectrum is kept between calls, and since only its top half is ever
+    # written, the zeroed bottom half stays zeroed.
+    spectrum = _get_buffer(
+        ("2d", n_fft_coeffs),
+        (n_fft_coeffs, n_fft_coeffs // 2 + 1),
+        dtype=complex,
     )
 
     for d in range(n_terms):
-        fft_in_buffer[:n_interpolation_points_1d, :n_interpolation_points_1d] = \
-            w[:, d].reshape(n_interpolation_points_1d, n_interpolation_points_1d)
-
-        fft_w_coefficients = scipy.fft.rfft2(fft_in_buffer, workers=num_threads)
-        fft_w_coefficients *= fft_kernel_tilde
-        fft_out_buffer = scipy.fft.irfft2(
-            fft_w_coefficients, s=(n_fft_coeffs, n_fft_coeffs), workers=num_threads
+        spectrum[:n_interpolation_points_1d] = scipy.fft.rfft(
+            w[:, d].reshape(n_interpolation_points_1d, n_interpolation_points_1d),
+            n=n_fft_coeffs,
+            axis=1,
+            workers=num_threads,
         )
 
-        o[:, d] = fft_out_buffer[
-            n_interpolation_points_1d:, n_interpolation_points_1d:
-        ].ravel()
+        fft_w_coefficients = scipy.fft.fft(spectrum, axis=0, workers=num_threads)
+        fft_w_coefficients *= fft_kernel_tilde
+
+        columns = scipy.fft.ifft(
+            fft_w_coefficients, axis=0, overwrite_x=True, workers=num_threads
+        )
+        fft_out_buffer = scipy.fft.irfft(
+            columns[n_interpolation_points_1d:],
+            n=n_fft_coeffs,
+            axis=1,
+            workers=num_threads,
+        )
+
+        o[:, d] = fft_out_buffer[:, n_interpolation_points_1d:].ravel()
