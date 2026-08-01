@@ -1,13 +1,14 @@
 import distutils
 import os
 import platform
+import subprocess
 import sys
 import tempfile
 import warnings
 from distutils import ccompiler
 from distutils.errors import CompileError, LinkError
 from distutils.sysconfig import customize_compiler
-from os.path import join
+from os.path import join, isdir
 
 import setuptools
 from Cython.Distutils.build_ext import new_build_ext as build_ext
@@ -71,7 +72,8 @@ def get_library_dirs():
     )
 
 
-def has_c_library(library, extension=".c"):
+def has_c_library(library, extension=".c", include_dirs=(), library_dirs=(),
+                  libraries=(), extra_preargs=(), extra_postargs=()):
     """Check whether a C/C++ library is available on the system to the compiler.
 
     Parameters
@@ -82,6 +84,15 @@ def has_c_library(library, extension=".c"):
     extension: str
         If we want to check for a C library, the extension is `.c`, for C++
         `.cc`, `.cpp` or `.cxx` are accepted.
+    include_dirs: Iterable[str]
+        Directories to search for headers in addition to the defaults.
+    library_dirs: Iterable[str]
+        Directories to search for the library in addition to the defaults.
+    libraries: Iterable[str]
+        Libraries to link the test program against, so that a header found
+        without a matching runtime is reported as unavailable.
+    extra_preargs, extra_postargs: Iterable[str]
+        Extra flags for both the compile and the link step.
 
     Returns
     -------
@@ -100,16 +111,84 @@ def has_c_library(library, extension=".c"):
         # Configure compiler to do all the platform specific things
         customize_compiler(compiler)
         # Add conda include dirs
-        for inc_dir in get_include_dirs():
+        for inc_dir in tuple(get_include_dirs()) + tuple(include_dirs):
             compiler.add_include_dir(inc_dir)
+        for lib_dir in library_dirs:
+            compiler.add_library_dir(lib_dir)
         assert isinstance(compiler, ccompiler.CCompiler)
 
         try:
             # Try to compile the file using the C compiler
-            compiler.link_executable(compiler.compile([name]), name)
+            objects = compiler.compile(
+                [name],
+                extra_preargs=list(extra_preargs),
+                extra_postargs=list(extra_postargs),
+            )
+            compiler.link_executable(
+                objects,
+                name,
+                libraries=list(libraries),
+                extra_preargs=list(extra_preargs),
+                extra_postargs=list(extra_postargs),
+            )
             return True
         except (CompileError, LinkError):
             return False
+
+
+def has_compiler_flag(flag, compiler_type):
+    """Check whether the compiler both accepts and acts on a flag.
+
+    Compilers accept unknown `-m` and `-f` flags with nothing more than a
+    warning, so a plain compile is not evidence that a flag did anything.
+    `-Werror` promotes that warning to an error, which is what makes the answer
+    meaningful.
+    """
+    if compiler_type != "unix":
+        return False
+
+    with tempfile.TemporaryDirectory(dir=".") as directory:
+        name = join(directory, "flagcheck.c")
+        with open(name, "w") as f:
+            f.write("int main() {}\n")
+
+        compiler = ccompiler.new_compiler()
+        customize_compiler(compiler)
+        try:
+            compiler.compile([name], extra_postargs=["-Werror", flag])
+            return True
+        except (CompileError, LinkError):
+            return False
+
+
+def get_openmp_prefixes():
+    """Installation prefixes to search for an OpenMP runtime.
+
+    Apple's compiler ships without one, and every way of installing `libomp`
+    on macOS puts it somewhere the compiler does not look by default. Without
+    this search the build falls back to a single-threaded extension on a
+    machine that is perfectly capable of running the parallel one.
+    """
+    if platform.system() != "Darwin":
+        return []
+
+    prefixes = []
+    try:
+        found = subprocess.run(
+            ["brew", "--prefix", "libomp"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30,
+        )
+        if found.returncode == 0:
+            prefixes.append(found.stdout.decode().strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    prefixes += [
+        "/opt/homebrew/opt/libomp",  # Homebrew, Apple silicon
+        "/usr/local/opt/libomp",  # Homebrew, Intel
+        "/opt/local",  # MacPorts
+    ]
+    return [p for p in prefixes if p and isdir(join(p, "include"))]
 
 
 class CythonBuildExt(build_ext):
@@ -155,24 +234,57 @@ class CythonBuildExt(build_ext):
         # we're building packages to be distributed by conda-forge, but if the
         # package is being built locally, this is desired
         if not ("AZURE_BUILD" in os.environ or "CONDA_BUILD" in os.environ):
-            if platform.machine() == "ppc64le":
-                extra_compile_args += ["-mcpu=native"]
-            if platform.machine() == "x86_64":
-                extra_compile_args += ["-march=native"]
+            machine = platform.machine().lower()
+            if machine in ("x86_64", "amd64", "i386", "i686"):
+                tuning = ["-march=native", "-mtune=native"]
+            elif machine in ("arm64", "aarch64", "ppc64le", "ppc64"):
+                tuning = ["-mcpu=native", "-mtune=native"]
+            else:
+                tuning = []
+
+            for flag in tuning:
+                if has_compiler_flag(flag, compiler):
+                    extra_compile_args += [flag]
+                    break
 
         # We will disable openmp flags if the compiler doesn't support it. This
         # is only really an issue with OSX clang
-        if has_c_library("omp"):
+        omp_compile_args, omp_link_args = [], []
+        if compiler == "msvc":
+            omp_compile_args, omp_link_args = ["/openmp"], ["/openmp"]
+            found_openmp = has_c_library("omp")
+        elif platform.system() == "Darwin":
+            # Apple's clang needs to be told to look at the OpenMP pragmas, and
+            # the runtime it links against is not one it ships with
+            omp_compile_args = ["-Xpreprocessor", "-fopenmp"]
+            omp_link_args = ["-lomp"]
+            found_openmp = has_c_library(
+                "omp", libraries=["omp"], extra_postargs=omp_compile_args
+            )
+            for prefix in [] if found_openmp else get_openmp_prefixes():
+                include_dir, library_dir = join(prefix, "include"), join(prefix, "lib")
+                if has_c_library(
+                    "omp",
+                    include_dirs=[include_dir],
+                    library_dirs=[library_dir],
+                    libraries=["omp"],
+                    extra_postargs=omp_compile_args,
+                ):
+                    print("Found openmp in %s" % prefix)
+                    omp_compile_args += ["-I" + include_dir]
+                    omp_link_args += ["-L" + library_dir, "-Wl,-rpath," + library_dir]
+                    found_openmp = True
+                    break
+        else:
+            omp_compile_args, omp_link_args = ["-fopenmp"], ["-fopenmp"]
+            found_openmp = has_c_library(
+                "omp", libraries=["gomp"], extra_postargs=omp_compile_args
+            ) or has_c_library("omp", extra_postargs=omp_compile_args)
+
+        if found_openmp:
             print("Found openmp. Compiling with openmp flags...")
-            if platform.system() == "Darwin" and compiler == "unix":
-                extra_compile_args += ["-Xpreprocessor", "-fopenmp"]
-                extra_link_args += ["-lomp"]
-            elif compiler == "unix":
-                extra_compile_args += ["-fopenmp"]
-                extra_link_args += ["-fopenmp"]
-            elif compiler == "msvc":
-                extra_compile_args += ["/openmp"]
-                extra_link_args += ["/openmp"]
+            extra_compile_args += omp_compile_args
+            extra_link_args += omp_link_args
         else:
             warnings.warn(
                 "You appear to be using a compiler which does not support "
