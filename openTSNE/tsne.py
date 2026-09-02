@@ -80,8 +80,9 @@ class IterationState:
 
     dof_grad: float
         The gradient of the loss with respect to ``dof``. Zero for
-        fixed-dof runs and for the FFT objective (which does not compute
-        the dof gradient).
+        fixed-dof runs, and when optimizing against a fixed reference
+        embedding under the FFT objective, which does not compute the dof
+        gradient in that case.
     """
 
     iteration: int
