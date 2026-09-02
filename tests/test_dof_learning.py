@@ -575,6 +575,26 @@ class TestDofAutoLearning(unittest.TestCase):
         self.assertNotEqual(emb.dof_, 1.0)
         self.assertTrue(all(np.isfinite(s.dof) and s.dof > 0 for s in history))
 
+    def test_fft_auto_learns_dof_1d(self):
+        # The 1d FFT estimator is a separate implementation from the 2d one and
+        # is only reachable through `n_components=1`, so it needs its own
+        # end-to-end check that dof is genuinely learned.
+        history = []
+        with self.assertNoLogs("openTSNE.tsne", level="WARNING"):
+            emb = TSNE_FFT(
+                n_components=1,
+                dof="auto",
+                initial_dof=1.0,
+                early_exaggeration_iter=0,
+                n_iter=20,
+                callbacks=history.append,
+                callbacks_every_iters=1,
+            ).fit(self.x)
+        self.assertTrue(history)
+        self.assertNotEqual(emb.dof_, 1.0)
+        self.assertTrue(np.isfinite(emb.dof_) and emb.dof_ > 0)
+        self.assertTrue(all(np.isfinite(s.dof) and s.dof > 0 for s in history))
+
     def test_fft_and_bh_learn_comparable_dof(self):
         # Both approximations descend the same objective, so the learned dof
         # values should land in the same neighborhood.
@@ -656,6 +676,28 @@ class TestDofLearningStability(unittest.TestCase):
         # And the final value should be reasonably consistent across schedules.
         vals = np.array(list(learned.values()))
         self.assertLess(vals.std() / vals.mean(), 0.4)
+
+    def test_dof_is_well_behaved_across_exaggeration_phases(self):
+        # `fit` runs an early-exaggeration phase before the main one, and the
+        # dof gradient is normalized by the exaggeration factor. Both
+        # objectives must therefore keep dof finite, positive and sane through
+        # the exaggerated phase and the transition out of it.
+        for name, TSNE_ in (("bh", TSNE_BH), ("fft", TSNE_FFT)):
+            history = []
+            emb = TSNE_(
+                dof="auto",
+                early_exaggeration_iter=25,
+                n_iter=50,
+                callbacks=history.append,
+                callbacks_every_iters=1,
+            ).fit(self.x)
+            phases = {s.exaggeration for s in history}
+            self.assertEqual(phases, {12, 1}, f"{name}: missing a phase, {phases}")
+            self.assertTrue(
+                all(np.isfinite(s.dof) and s.dof > 0 for s in history),
+                f"{name}: dof left the positive reals, {[s.dof for s in history]}",
+            )
+            self.assertTrue(0.1 < emb.dof_ < 20.0, f"{name}: dof_={emb.dof_}")
 
     def test_dof_lr_is_n_independent(self):
         # The same dof_lr should give comparable learned dof regardless of the
