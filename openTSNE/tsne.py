@@ -1306,12 +1306,22 @@ class TSNEEmbedding(np.ndarray):
         else:
             raise RuntimeError("Cannot prepare interpolation grid for >2d embeddings")
 
+        # The grid encodes the reference kernel, so it must be built with the
+        # dof actually in effect: for `dof="auto"` that is the learned `dof_`,
+        # falling back through the same cascade as `_resolve_partial_dof` when
+        # the embedding was never optimized.
+        dof = self.gradient_descent_params["dof"]
+        if not isinstance(dof, (int, float)):
+            dof = self.dof_
+            if dof is None:
+                dof = self.gradient_descent_params.get("initial_dof") or 1.0
+
         result = f(
             self.ravel() if self.shape[1] == 1 else self,
             self.gradient_descent_params["n_interpolation_points"],
             self.gradient_descent_params["min_num_intervals"],
             self.gradient_descent_params["ints_in_interval"],
-            self.gradient_descent_params["dof"],
+            dof,
             padding=padding,
         )
 
@@ -1472,11 +1482,12 @@ class TSNE(BaseEstimator):
         Degrees of freedom as described in Kobak et al. "Heavy-tailed kernels
         reveal a finer cluster structure in t-SNE visualisations", 2019. If
         ``dof="auto"``, the degrees of freedom are learned during optimization
-        jointly with the embedding (only supported with
-        ``negative_gradient_method="bh"``; the FFT path will warn and keep dof
-        fixed at ``initial_dof``). The latest learned value is written back to
-        ``embedding.dof_`` and persists across consecutive ``optimize()``
-        calls.
+        jointly with the embedding. Supported by both the Barnes-Hut and FFT
+        negative gradient methods; when embedding new points into an existing
+        embedding (``transform``), only Barnes-Hut computes the dof gradient
+        and the FFT path will warn and keep dof fixed. The latest learned
+        value is written back to ``embedding.dof_`` and persists across
+        consecutive ``optimize()`` calls.
 
     initial_dof: Optional[float]
         Starting value for the learnable degrees of freedom when
@@ -1990,9 +2001,17 @@ def kl_divergence_fft(
     reference_embedding=None,
     should_eval_error=False,
     n_jobs=1,
+    compute_dof_grad=False,
     **_,
 ):
     gradient = np.zeros_like(embedding, dtype=np.float64, order="C")
+
+    # The dof gradient is only implemented for self-embeddings: the grid-based
+    # (transform) path does not compute its negative term; see the guard in
+    # `gradient_descent.__call__`.
+    if reference_embedding is not None:
+        compute_dof_grad = False
+    alpha_grad_neg = 0.0
 
     # Compute negative gradient.
     if embedding.ndim == 1 or embedding.shape[1] == 1:
@@ -2006,9 +2025,13 @@ def kl_divergence_fft(
                 dof=dof,
             )
         else:
-            sum_Q = _tsne.estimate_negative_gradient_fft_1d(
-                embedding.ravel(), gradient.ravel(), **fft_params, dof=dof,
+            sum_Q, alpha_grad_neg = _tsne.estimate_negative_gradient_fft_1d(
+                embedding.ravel(),
+                gradient.ravel(),
+                **fft_params,
+                dof=dof,
                 num_threads=n_jobs,
+                compute_dof_grad=compute_dof_grad,
             )
     elif embedding.shape[1] == 2:
         if reference_embedding is not None:
@@ -2022,8 +2045,13 @@ def kl_divergence_fft(
                 dof=dof,
             )
         else:
-            sum_Q = _tsne.estimate_negative_gradient_fft_2d(
-                embedding, gradient, **fft_params, dof=dof, num_threads=n_jobs,
+            sum_Q, alpha_grad_neg = _tsne.estimate_negative_gradient_fft_2d(
+                embedding,
+                gradient,
+                **fft_params,
+                dof=dof,
+                num_threads=n_jobs,
+                compute_dof_grad=compute_dof_grad,
             )
     else:
         raise RuntimeError(
@@ -2036,7 +2064,7 @@ def kl_divergence_fft(
         reference_embedding = embedding
 
     # Compute positive gradient
-    sum_P, kl_divergence_, _alpha_grad_pos = _tsne.estimate_positive_gradient_nn(
+    sum_P, kl_divergence_, alpha_grad_pos = _tsne.estimate_positive_gradient_nn(
         P.indices,
         P.indptr,
         P.data,
@@ -2046,15 +2074,18 @@ def kl_divergence_fft(
         dof,
         num_threads=n_jobs,
         should_eval_error=should_eval_error,
+        compute_dof_grad=compute_dof_grad,
     )
 
     if should_eval_error:
         kl_divergence_ += sum_P * np.log(sum_Q + EPSILON)
 
-    # The FFT negative-gradient kernels do not compute the dof-gradient term,
-    # so we cannot return a meaningful value here. Learning dof requires the
-    # Barnes-Hut objective; see the guard in `gradient_descent.__call__`.
-    return GradientResult(error=kl_divergence_, gradient=gradient, dof_grad=0.0)
+    dof_grad = alpha_grad_pos - alpha_grad_neg if compute_dof_grad else 0.0
+    return GradientResult(
+        error=kl_divergence_,
+        gradient=gradient,
+        dof_grad=dof_grad,
+    )
 
 
 class gradient_descent:
@@ -2148,8 +2179,9 @@ class gradient_descent:
         dof: Union[float, str]
             Degrees of freedom of the Student's t-distribution. If
             ``dof="auto"``, the degrees of freedom are learned during
-            optimization (only supported with
-            ``negative_gradient_method="bh"``); the optimizer warm-starts from
+            optimization (supported by both the Barnes-Hut and FFT objectives
+            for self-embeddings; only Barnes-Hut when embedding into a
+            reference embedding); the optimizer warm-starts from
             ``embedding.dof_`` if set, otherwise from ``initial_dof``,
             otherwise from 1.0.
 
@@ -2330,13 +2362,18 @@ class gradient_descent:
 
         initial_iter = getattr(embedding, "optimization_iters_", 0) or 0
 
-        if dof == "auto" and objective_function is kl_divergence_fft:
+        if (
+            dof == "auto"
+            and objective_function is kl_divergence_fft
+            and reference_embedding is not None
+        ):
             log.warning(
-                "Learning the degrees of freedom (`dof='auto'`) is only "
-                "implemented for the Barnes-Hut objective. The FFT objective "
-                "does not compute the dof gradient, so dof will remain fixed "
-                "at `initial_dof=%s`. Set `negative_gradient_method='bh'` to "
-                "actually learn dof.",
+                "Learning the degrees of freedom (`dof='auto'`) with the FFT "
+                "objective is only implemented for self-embeddings. When "
+                "embedding new points into an existing embedding, the dof "
+                "gradient is not computed, so dof will remain fixed at %s. Set "
+                "`negative_gradient_method='bh'` to learn dof during "
+                "transform.",
                 dof_,
             )
 
