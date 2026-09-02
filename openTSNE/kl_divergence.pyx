@@ -128,7 +128,7 @@ cpdef double kl_divergence_approx_fft(
 
 
     if n_dims == 1:
-        sum_Q = estimate_negative_gradient_fft_1d(
+        sum_Q, _ = estimate_negative_gradient_fft_1d(
             embedding.ravel(),
             gradient.ravel(),
             n_interpolation_points,
@@ -137,7 +137,7 @@ cpdef double kl_divergence_approx_fft(
             dof,
         )
     elif n_dims == 2:
-        sum_Q = estimate_negative_gradient_fft_2d(
+        sum_Q, _ = estimate_negative_gradient_fft_2d(
             embedding,
             gradient,
             n_interpolation_points,

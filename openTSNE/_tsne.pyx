@@ -340,11 +340,24 @@ cdef void _estimate_negative_gradient_single(
 # The kernel matrix is rebuilt every iteration because the grid follows the
 # embedding's extent, and at 45k points it is a 1134x1134 array. Reusing the
 # allocation avoids both the allocation and the page faults that come with
-# touching fresh memory. One buffer per kernel, since when dof != 1 the plain
-# and squared kernels are both live at once. Each thread keeps its own: the
-# transforms release the GIL while they read a kernel, so embeddings optimized
-# concurrently in different threads must not share one.
+# touching fresh memory. One buffer per kernel kind, since every kernel an
+# iteration needs is live at once: the plain and squared kernels when dof != 1,
+# and the dof-gradient kernel too while dof is learned. Each thread keeps its
+# own: the transforms release the GIL while they read a kernel, so embeddings
+# optimized concurrently in different threads must not share one.
 cdef object _kernel_buffers_local = threading.local()
+
+
+# The kernels the FFT interpolation convolves against. With the plain Cauchy
+# kernel k(d) = (1 + d/dof)^-dof, the squared one is (1 + d/dof)^-(dof + 1) and
+# the dof-gradient kernel is M(d) = k(d) g(d), the per-pair factor of the
+# negative dof gradient (see `dof_grad_g`). M(0) = 0, so the spurious
+# self-interaction terms picked up by the grid contribute nothing and need no
+# correction.
+cdef enum KernelKind:
+    KERNEL_CAUCHY
+    KERNEL_CAUCHY_SQUARED
+    KERNEL_DOF_GRAD
 
 
 cdef dict _kernel_buffers():
@@ -354,22 +367,34 @@ cdef dict _kernel_buffers():
     return buffers
 
 
-cdef double[:, ::1] _kernel_buffer_2d(Py_ssize_t size, bint exp1p):
+cdef double[:, ::1] _kernel_buffer_2d(Py_ssize_t size, KernelKind kind):
     cdef dict buffers = _kernel_buffers()
-    cdef object buf = buffers.get(exp1p)
+    cdef object buf = buffers.get(kind)
     if buf is None or buf.shape[0] != size:
         buf = np.zeros((size, size), dtype=float)
-        buffers[exp1p] = buf
+        buffers[kind] = buf
     return buf
 
 
-cdef double[::1] _kernel_buffer_1d(Py_ssize_t size, bint exp1p):
+cdef double[::1] _kernel_buffer_1d(Py_ssize_t size, KernelKind kind):
     cdef dict buffers = _kernel_buffers()
-    cdef object buf = buffers.get(("1d", exp1p))
+    cdef object buf = buffers.get(("1d", kind))
     if buf is None or buf.shape[0] != size:
         buf = np.zeros(size, dtype=float)
-        buffers[("1d", exp1p)] = buf
+        buffers[("1d", kind)] = buf
     return buf
+
+
+cdef inline double dof_grad_g(double sq_dist, double dof) noexcept nogil:
+    # g(x) = log(1 + x) - x / (1 + x) with x = d / dof, the per-pair factor of
+    # the dof gradient (d/d(dof) log k = -g). The closed form subtracts two
+    # O(x) quantities to produce an O(x^2) result, so for small x it is
+    # evaluated via the series g(x) = x^2/2 - 2x^3/3 + 3x^4/4 - 4x^5/5 + O(x^6)
+    # to avoid catastrophic cancellation.
+    cdef double x = sq_dist / dof
+    if x < 1e-3:
+        return x * x * (0.5 - x * (2.0 / 3.0 - x * (0.75 - x * 0.8)))
+    return log(1.0 + x) - x / (1.0 + x)
 
 
 cdef double[:, ::1] interpolate(double[::1] y_in_box, double[::1] y_tilde):
@@ -399,7 +424,7 @@ cdef double[:, ::1] interpolate(double[::1] y_in_box, double[::1] y_tilde):
 
 
 cdef double[::1] compute_kernel_tilde_1d(
-    bint exp1p,
+    KernelKind kind,
     Py_ssize_t n_interpolation_points_1d,
     double coord_min,
     double coord_spacing,
@@ -409,17 +434,17 @@ cdef double[::1] compute_kernel_tilde_1d(
         double[::1] y_tilde = np.empty(n_interpolation_points_1d, dtype=float)
 
         Py_ssize_t embedded_size = 2 * n_interpolation_points_1d
-        double[::1] kernel_tilde = _kernel_buffer_1d(embedded_size, exp1p)
+        double[::1] kernel_tilde = _kernel_buffer_1d(embedded_size, kind)
 
         Py_ssize_t i
-        double y_diff, tmp, exponent
+        double y_diff, sq_dist, tmp, exponent
         bint dof_is_one = dof == 1
 
     y_tilde[0] = coord_spacing / 2 + coord_min
     for i in range(1, n_interpolation_points_1d):
         y_tilde[i] = y_tilde[i - 1] + coord_spacing
 
-    if exp1p:
+    if kind == KERNEL_CAUCHY_SQUARED:
         exponent = -(dof + 1)
     else:
         exponent = -dof
@@ -430,9 +455,12 @@ cdef double[::1] compute_kernel_tilde_1d(
     for i in range(n_interpolation_points_1d):
         y_diff = y_tilde[0] - y_tilde[i]
 
-        if dof_is_one:
+        if kind == KERNEL_DOF_GRAD:
+            sq_dist = y_diff * y_diff
+            tmp = (1 + sq_dist / dof) ** exponent * dof_grad_g(sq_dist, dof)
+        elif dof_is_one:
             tmp = 1 + y_diff * y_diff
-            if exp1p:
+            if kind == KERNEL_CAUCHY_SQUARED:
                 tmp = 1 / (tmp * tmp)
             else:
                 tmp = 1 / tmp
@@ -445,7 +473,7 @@ cdef double[::1] compute_kernel_tilde_1d(
     return kernel_tilde
 
 
-cpdef double estimate_negative_gradient_fft_1d(
+cpdef tuple estimate_negative_gradient_fft_1d(
     double[::1] embedding,
     double[::1] gradient,
     Py_ssize_t n_interpolation_points=3,
@@ -453,7 +481,18 @@ cpdef double estimate_negative_gradient_fft_1d(
     double ints_in_interval=1,
     double dof=1,
     Py_ssize_t num_threads=1,
+    bint compute_dof_grad=False,
 ):
+    """Estimate the negative t-SNE gradient using the FFT interpolation scheme.
+
+    Returns
+    -------
+    sum_Q : double
+        The sum of all q_{ij} values.
+    alpha_grad_neg : double
+        The negative term of the gradient with respect to alpha, i.e.
+        (1/Z) sum_ij k(d_ij) g(d_ij). Zero unless ``compute_dof_grad`` is set.
+    """
     cdef Py_ssize_t i, j, d, box_idx, n_samples = embedding.shape[0]
     cdef double y_max = -INFINITY, y_min = INFINITY
     if num_threads < 1:
@@ -522,13 +561,19 @@ cpdef double estimate_negative_gradient_fft_1d(
 
     # Evaluate the the squared cauchy kernel at the interpolation nodes
     cdef double[::1] sq_kernel_tilde = compute_kernel_tilde_1d(
-        True, n_interpolation_points_1d, y_min, h * box_width, dof
+        KERNEL_CAUCHY_SQUARED, n_interpolation_points_1d, y_min, h * box_width, dof
     )
     # The non-square cauchy kernel is only used if dof != 1, so don't do unnecessary work
     cdef double[::1] kernel_tilde
     if dof != 1:
         kernel_tilde = compute_kernel_tilde_1d(
-            False, n_interpolation_points_1d, y_min, h * box_width, dof
+            KERNEL_CAUCHY, n_interpolation_points_1d, y_min, h * box_width, dof
+        )
+    # The dof-gradient kernel M = k * g is only needed when learning dof
+    cdef double[::1] dof_kernel_tilde
+    if compute_dof_grad:
+        dof_kernel_tilde = compute_kernel_tilde_1d(
+            KERNEL_DOF_GRAD, n_interpolation_points_1d, y_min, h * box_width, dof
         )
 
     # STEP 1: Compute the w coefficients
@@ -571,14 +616,24 @@ cpdef double estimate_negative_gradient_fft_1d(
     else:
         matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients, y_tilde_values, num_threads)
 
+    # The dof-gradient potential is a convolution of the M kernel against unit
+    # charges, which are exactly the w coefficients of the first term
+    cdef double[:, ::1] dof_y_tilde_values
+    if compute_dof_grad:
+        dof_y_tilde_values = np.empty((n_interpolation_points_1d, 1), dtype=float)
+        matrix_multiply_fft_1d(dof_kernel_tilde, w_coefficients[:, :1], dof_y_tilde_values, num_threads)
 
     # STEP 3: Compute the potentials \tilde{\phi(y_i)}
     cdef double[:, ::1] phi = np.zeros((n_samples, n_terms), dtype=float)
+    cdef double dof_grad_neg_unnormalized = 0
     for i in range(n_samples):
         box_idx = point_box_idx[i] * n_interpolation_points
         for j in range(n_interpolation_points):
             for d in range(n_terms):
                 phi[i, d] += interpolated_values[i, j] * y_tilde_values[box_idx + j, d]
+            if compute_dof_grad:
+                dof_grad_neg_unnormalized += \
+                    interpolated_values[i, j] * dof_y_tilde_values[box_idx + j, 0]
 
     PyMem_Free(point_box_idx)
 
@@ -595,11 +650,18 @@ cpdef double estimate_negative_gradient_fft_1d(
 
     sum_Q -= n_samples
 
+    # The negative dof-gradient term shares the normalization Z = sum_Q. The
+    # M kernel vanishes at zero distance, so unlike sum_Q it needs no
+    # self-interaction correction.
+    cdef double alpha_grad_neg = 0
+    if compute_dof_grad:
+        alpha_grad_neg = dof_grad_neg_unnormalized / (sum_Q + EPSILON)
+
     # The phis used here are not affected if dof != 1
     for i in range(n_samples):
         gradient[i] -= (embedding[i] * phi[i, 0] - phi[i, 1]) / (sum_Q + EPSILON)
 
-    return sum_Q
+    return sum_Q, alpha_grad_neg
 
 
 cpdef tuple prepare_negative_gradient_fft_interpolation_grid_1d(
@@ -670,13 +732,13 @@ cpdef tuple prepare_negative_gradient_fft_interpolation_grid_1d(
 
     # Evaluate the squared cauchy kernel at the interpolation nodes
     cdef double[::1] sq_kernel_tilde = compute_kernel_tilde_1d(
-        True, n_interpolation_points_1d, y_min, h * box_width, dof
+        KERNEL_CAUCHY_SQUARED, n_interpolation_points_1d, y_min, h * box_width, dof
     )
     # The non-square cauchy kernel is only used if dof != 1, so don't do unnecessary work
     cdef double[::1] kernel_tilde
     if dof != 1:
         kernel_tilde = compute_kernel_tilde_1d(
-            False, n_interpolation_points_1d, y_min, h * box_width, dof
+            KERNEL_CAUCHY, n_interpolation_points_1d, y_min, h * box_width, dof
         )
 
     # STEP 1: Compute the w coefficients
@@ -802,7 +864,7 @@ cpdef double estimate_negative_gradient_fft_1d_with_grid(
 
 
 cdef double[:, ::1] compute_kernel_tilde_2d(
-    bint exp1p,
+    KernelKind kind,
     Py_ssize_t n_interpolation_points_1d,
     double coord_min,
     double coord_spacing,
@@ -810,21 +872,21 @@ cdef double[:, ::1] compute_kernel_tilde_2d(
 ):
     """Evaluate the kernel at every pair of interpolation nodes.
 
-    `exp1p` selects the squared Cauchy kernel over the plain one. It is a flag
-    rather than a function pointer because this is a quarter of a million
-    evaluations per call and an indirect call cannot be inlined; with the
-    kernel written out here, the `dof` branch is hoisted out of the loop and
-    the whole body collapses to a handful of instructions.
+    `kind` selects the kernel (see `KernelKind`). It is an enum rather than a
+    function pointer because this is a quarter of a million evaluations per
+    call and an indirect call cannot be inlined; with the kernels written out
+    here, the `kind` and `dof` branches are hoisted out of the loop and the
+    whole body collapses to a handful of instructions.
     """
     cdef:
         double[::1] y_tilde = np.empty(n_interpolation_points_1d, dtype=float)
         double[::1] x_tilde = np.empty(n_interpolation_points_1d, dtype=float)
 
         Py_ssize_t embedded_size = 2 * n_interpolation_points_1d
-        double[:, ::1] kernel_tilde = _kernel_buffer_2d(embedded_size, exp1p)
+        double[:, ::1] kernel_tilde = _kernel_buffer_2d(embedded_size, kind)
 
         Py_ssize_t i, j
-        double y_diff, x_diff, tmp, exponent
+        double y_diff, x_diff, sq_dist, tmp, exponent
         bint dof_is_one = dof == 1
         double * row_above
         double * row_below
@@ -835,7 +897,7 @@ cdef double[:, ::1] compute_kernel_tilde_2d(
         x_tilde[i] = x_tilde[i - 1] + coord_spacing
         y_tilde[i] = y_tilde[i - 1] + coord_spacing
 
-    if exp1p:
+    if kind == KERNEL_CAUCHY_SQUARED:
         exponent = -(dof + 1)
     else:
         exponent = -dof
@@ -851,9 +913,12 @@ cdef double[:, ::1] compute_kernel_tilde_2d(
         for j in range(n_interpolation_points_1d):
             x_diff = x_tilde[0] - x_tilde[j]
 
-            if dof_is_one:
+            if kind == KERNEL_DOF_GRAD:
+                sq_dist = y_diff * y_diff + x_diff * x_diff
+                tmp = (1 + sq_dist / dof) ** exponent * dof_grad_g(sq_dist, dof)
+            elif dof_is_one:
                 tmp = 1 + y_diff * y_diff + x_diff * x_diff
-                if exp1p:
+                if kind == KERNEL_CAUCHY_SQUARED:
                     tmp = 1 / (tmp * tmp)
                 else:
                     tmp = 1 / tmp
@@ -868,7 +933,7 @@ cdef double[:, ::1] compute_kernel_tilde_2d(
     return kernel_tilde
 
 
-cpdef double estimate_negative_gradient_fft_2d(
+cpdef tuple estimate_negative_gradient_fft_2d(
     double[:, ::1] embedding,
     double[:, ::1] gradient,
     Py_ssize_t n_interpolation_points=3,
@@ -876,7 +941,18 @@ cpdef double estimate_negative_gradient_fft_2d(
     double ints_in_interval=1,
     double dof=1,
     Py_ssize_t num_threads=1,
+    bint compute_dof_grad=False,
 ):
+    """Estimate the negative t-SNE gradient using the FFT interpolation scheme.
+
+    Returns
+    -------
+    sum_Q : double
+        The sum of all q_{ij} values.
+    alpha_grad_neg : double
+        The negative term of the gradient with respect to alpha, i.e.
+        (1/Z) sum_ij k(d_ij) g(d_ij). Zero unless ``compute_dof_grad`` is set.
+    """
     cdef:
         Py_ssize_t i, j, d, box_idx
         Py_ssize_t n_samples = embedding.shape[0]
@@ -965,13 +1041,19 @@ cpdef double estimate_negative_gradient_fft_2d(
 
     # Evaluate the squared cauchy kernel at the interpolation nodes
     cdef double[:, ::1] sq_kernel_tilde = compute_kernel_tilde_2d(
-         True, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
+         KERNEL_CAUCHY_SQUARED, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
     )
     # The non-square cauchy kernel is only used if dof != 1, so don't do unnecessary work
     cdef double[:, ::1] kernel_tilde
     if dof != 1:
         kernel_tilde = compute_kernel_tilde_2d(
-            False, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
+            KERNEL_CAUCHY, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
+        )
+    # The dof-gradient kernel M = k * g is only needed when learning dof
+    cdef double[:, ::1] dof_kernel_tilde
+    if compute_dof_grad:
+        dof_kernel_tilde = compute_kernel_tilde_2d(
+            KERNEL_DOF_GRAD, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
         )
 
     # STEP 1: Compute the w coefficients
@@ -1038,8 +1120,16 @@ cpdef double estimate_negative_gradient_fft_2d(
     else:
         matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients, y_tilde_values, num_threads)
 
+    # The dof-gradient potential is a convolution of the M kernel against unit
+    # charges, which are exactly the w coefficients of the first term
+    cdef double[:, ::1] dof_y_tilde_values
+    if compute_dof_grad:
+        dof_y_tilde_values = np.empty((total_interpolation_points, 1), dtype=float)
+        matrix_multiply_fft_2d(dof_kernel_tilde, w_coefficients[:, :1], dof_y_tilde_values, num_threads)
+
     # STEP 3: Compute the potentials \tilde{\phi(y_i)}
     cdef double[:, ::1] phi = np.zeros((n_samples, n_terms), dtype=float)
+    cdef double dof_grad_neg_unnormalized = 0
     for i in range(n_samples):
         box_idx = point_box_idx[i]
         box_i = box_idx % n_boxes_1d
@@ -1054,6 +1144,11 @@ cpdef double estimate_negative_gradient_fft_2d(
                     phi[i, d] += x_interpolated_values[i, interp_i] * \
                                  y_interpolated_values[i, interp_j] * \
                                  y_tilde_values[idx, d]
+                if compute_dof_grad:
+                    dof_grad_neg_unnormalized += \
+                        x_interpolated_values[i, interp_i] * \
+                        y_interpolated_values[i, interp_j] * \
+                        dof_y_tilde_values[idx, 0]
 
     PyMem_Free(point_box_idx)
 
@@ -1073,12 +1168,19 @@ cpdef double estimate_negative_gradient_fft_2d(
 
     sum_Q -= n_samples
 
+    # The negative dof-gradient term shares the normalization Z = sum_Q. The
+    # M kernel vanishes at zero distance, so unlike sum_Q it needs no
+    # self-interaction correction.
+    cdef double alpha_grad_neg = 0
+    if compute_dof_grad:
+        alpha_grad_neg = dof_grad_neg_unnormalized / (sum_Q + EPSILON)
+
     # The phis used here are not affected if dof != 1
     for i in range(n_samples):
         gradient[i, 0] -= (embedding[i, 0] * phi[i, 0] - phi[i, 1]) / (sum_Q + EPSILON)
         gradient[i, 1] -= (embedding[i, 1] * phi[i, 0] - phi[i, 2]) / (sum_Q + EPSILON)
 
-    return sum_Q
+    return sum_Q, alpha_grad_neg
 
 
 cpdef tuple prepare_negative_gradient_fft_interpolation_grid_2d(
@@ -1165,13 +1267,13 @@ cpdef tuple prepare_negative_gradient_fft_interpolation_grid_2d(
 
     # Evaluate the the squared cauchy kernel at the interpolation nodes
     cdef double[:, ::1] sq_kernel_tilde = compute_kernel_tilde_2d(
-         True, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
+         KERNEL_CAUCHY_SQUARED, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
     )
     # The non-square cauchy kernel is only used if dof != 1, so don't do unnecessary work
     cdef double[:, ::1] kernel_tilde
     if dof != 1:
         kernel_tilde = compute_kernel_tilde_2d(
-            False, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
+            KERNEL_CAUCHY, n_interpolation_points * n_boxes_1d, coord_min, h * box_width, dof,
         )
 
     # STEP 1: Compute the w coefficients
