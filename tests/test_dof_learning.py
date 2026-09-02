@@ -163,19 +163,147 @@ class TestKLDivergenceFFTReturnType(_ObjectiveFnMixin, unittest.TestCase):
         self.assertIsInstance(result, GradientResult)
         self.assertEqual(result.gradient.shape, self.embedding.shape)
 
-    def test_dof_grad_always_zero(self):
-        # FFT objective does not compute dof_grad; it must be 0 regardless of
-        # whether the caller asked for it.
-        for flag in (False, True):
-            with self.subTest(compute_dof_grad=flag):
+    def test_compute_dof_grad_false_yields_zero(self):
+        result = kl_divergence_fft(
+            self.embedding.copy(),
+            self.P,
+            dof=1.0,
+            fft_params=self.fft_params,
+            compute_dof_grad=False,
+        )
+        self.assertEqual(result.dof_grad, 0.0)
+
+    def test_compute_dof_grad_true_yields_nonzero(self):
+        # Both the dof=1 fast path and the general path must produce a real
+        # gradient, since learning starts at dof=1 by default.
+        for dof in (1.0, 2.5):
+            with self.subTest(dof=dof):
                 result = kl_divergence_fft(
                     self.embedding.copy(),
                     self.P,
-                    dof=1.0,
+                    dof=dof,
                     fft_params=self.fft_params,
-                    compute_dof_grad=flag,
+                    compute_dof_grad=True,
                 )
-                self.assertEqual(result.dof_grad, 0.0)
+                self.assertNotEqual(result.dof_grad, 0.0)
+                self.assertTrue(np.isfinite(result.dof_grad))
+
+    def test_gradient_unaffected_by_compute_dof_grad(self):
+        # Toggling the flag must not change the embedding gradient itself.
+        r1 = kl_divergence_fft(
+            self.embedding.copy(),
+            self.P,
+            dof=1.0,
+            fft_params=self.fft_params,
+            compute_dof_grad=False,
+        )
+        r2 = kl_divergence_fft(
+            self.embedding.copy(),
+            self.P,
+            dof=1.0,
+            fft_params=self.fft_params,
+            compute_dof_grad=True,
+        )
+        np.testing.assert_allclose(r1.gradient, r2.gradient)
+
+    def test_dof_grad_matches_finite_difference(self):
+        """The analytic dof_grad must match a central-difference estimate of
+        dKL/d(dof) computed through the same FFT objective, so the
+        interpolation error cancels and only the truncation error remains."""
+        rng = np.random.RandomState(7)
+        embedding = rng.randn(self.embedding.shape[0], 2) * 0.5
+        h = 1e-4
+
+        for dof in (0.5, 1.0, 2.5):
+            with self.subTest(dof=dof):
+                analytical = kl_divergence_fft(
+                    embedding.copy(),
+                    self.P,
+                    dof=dof,
+                    fft_params=self.fft_params,
+                    should_eval_error=True,
+                    compute_dof_grad=True,
+                ).dof_grad
+                kl_plus = kl_divergence_fft(
+                    embedding.copy(),
+                    self.P,
+                    dof=dof + h,
+                    fft_params=self.fft_params,
+                    should_eval_error=True,
+                ).error
+                kl_minus = kl_divergence_fft(
+                    embedding.copy(),
+                    self.P,
+                    dof=dof - h,
+                    fft_params=self.fft_params,
+                    should_eval_error=True,
+                ).error
+                finite_diff = (kl_plus - kl_minus) / (2 * h)
+
+                self.assertGreater(abs(analytical), 1e-3)
+                rel_err = abs(analytical - finite_diff) / abs(analytical)
+                self.assertLess(
+                    rel_err,
+                    1e-4,
+                    f"dof_grad={analytical:.6g}, finite_diff={finite_diff:.6g}, "
+                    f"rel_err={rel_err:.3g}",
+                )
+
+    def test_dof_grad_matches_exact_computation(self):
+        """The FFT dof_grad must match the exact O(N^2) gradient to
+        interpolation tolerance across heavy-, standard-, and light-tailed
+        regimes."""
+        rng = np.random.RandomState(7)
+        embedding = rng.randn(self.embedding.shape[0], 2) * 0.5
+
+        def exact_dof_grad(emb, P, dof):
+            d = ((emb[:, None, :] - emb[None, :, :]) ** 2).sum(-1)
+            k = (1 + d / dof) ** -dof
+            g = np.log1p(d / dof) - d / (dof + d + np.finfo(float).tiny)
+            np.fill_diagonal(k, 0.0)
+            np.fill_diagonal(g, 0.0)
+            a_pos = (P.toarray() * g).sum()
+            a_neg = (k * g).sum() / k.sum()
+            return a_pos - a_neg
+
+        for dof in (0.3, 1.0, 5.0):
+            with self.subTest(dof=dof):
+                exact = exact_dof_grad(embedding, self.P, dof)
+                fft = kl_divergence_fft(
+                    embedding.copy(),
+                    self.P,
+                    dof=dof,
+                    fft_params=self.fft_params,
+                    compute_dof_grad=True,
+                ).dof_grad
+                rel_err = abs(fft - exact) / abs(exact)
+                self.assertLess(
+                    rel_err,
+                    1e-4,
+                    f"fft={fft:.10g}, exact={exact:.10g}, rel_err={rel_err:.3g}",
+                )
+
+    def test_dof_grad_matches_exact_computation_1d(self):
+        rng = np.random.RandomState(7)
+        embedding = rng.randn(self.embedding.shape[0], 1) * 0.5
+
+        d = (embedding[:, None, 0] - embedding[None, :, 0]) ** 2
+        dof = 2.5
+        k = (1 + d / dof) ** -dof
+        g = np.log1p(d / dof) - d / (dof + d + np.finfo(float).tiny)
+        np.fill_diagonal(k, 0.0)
+        np.fill_diagonal(g, 0.0)
+        exact = (self.P.toarray() * g).sum() - (k * g).sum() / k.sum()
+
+        fft = kl_divergence_fft(
+            embedding.copy(),
+            self.P,
+            dof=dof,
+            fft_params=self.fft_params,
+            compute_dof_grad=True,
+        ).dof_grad
+        rel_err = abs(fft - exact) / abs(exact)
+        self.assertLess(rel_err, 1e-3, f"fft={fft:.10g}, exact={exact:.10g}")
 
 
 class TestOptimizerReturnShape(unittest.TestCase):
@@ -430,11 +558,12 @@ class TestDofAutoLearning(unittest.TestCase):
         )
         self.assertEqual(history[0].dof, learned_dof)
 
-    def test_fft_auto_warns_and_keeps_dof_fixed(self):
-        # FFT path cannot learn dof; we must warn and dof must remain fixed.
+    def test_fft_auto_learns_dof(self):
+        # The FFT path learns dof for self-embeddings just like BH: no
+        # warning, and dof must actually move away from its starting value.
         history = []
-        with self.assertLogs("openTSNE.tsne", level="WARNING") as cm:
-            TSNE_FFT(
+        with self.assertNoLogs("openTSNE.tsne", level="WARNING"):
+            emb = TSNE_FFT(
                 dof="auto",
                 initial_dof=1.0,
                 early_exaggeration_iter=0,
@@ -442,11 +571,54 @@ class TestDofAutoLearning(unittest.TestCase):
                 callbacks=history.append,
                 callbacks_every_iters=1,
             ).fit(self.x)
-        self.assertTrue(
-            any("dof='auto'" in msg or "Barnes-Hut" in msg for msg in cm.output),
-            f"Expected dof-auto warning, got: {cm.output}",
+        self.assertTrue(history)
+        self.assertNotEqual(emb.dof_, 1.0)
+        self.assertTrue(all(np.isfinite(s.dof) and s.dof > 0 for s in history))
+
+    def test_fft_and_bh_learn_comparable_dof(self):
+        # Both approximations descend the same objective, so the learned dof
+        # values should land in the same neighborhood.
+        emb_bh = TSNE_BH(dof="auto", n_iter=250).fit(self.x)
+        emb_fft = TSNE_FFT(dof="auto", n_iter=250).fit(self.x)
+        self.assertLess(
+            abs(np.log(emb_fft.dof_) - np.log(emb_bh.dof_)),
+            np.log(2),
+            f"bh dof_={emb_bh.dof_:.4f}, fft dof_={emb_fft.dof_:.4f}",
         )
-        self.assertTrue(all(s.dof == 1.0 for s in history))
+
+    def test_fft_transform_auto_warns_and_keeps_dof_fixed(self):
+        # The FFT dof gradient is only implemented for self-embeddings: when
+        # optimizing against a fixed reference (transform), the FFT path must
+        # warn and keep dof fixed.
+        rng = np.random.RandomState(0)
+        idx = rng.permutation(len(self.x))
+        x_train, x_new = self.x[idx[:120]], self.x[idx[120:]]
+
+        reference = TSNE_FFT(
+            dof="auto", early_exaggeration_iter=5, n_iter=20,
+        ).fit(x_train)
+        learned_dof = reference.dof_
+
+        with warnings.catch_warnings():
+            # prepare_partial(dof="auto") itself warns about uncharted
+            # territory; that is not the warning under test.
+            warnings.simplefilter("ignore")
+            partial = reference.prepare_partial(x_new, dof="auto")
+
+        history = []
+        with self.assertLogs("openTSNE.tsne", level="WARNING") as cm:
+            partial.optimize(
+                n_iter=5,
+                inplace=True,
+                callbacks=lambda s: history.append(s.dof),
+                callbacks_every_iters=1,
+            )
+        self.assertTrue(
+            any("self-embeddings" in msg for msg in cm.output),
+            f"Expected transform dof warning, got: {cm.output}",
+        )
+        self.assertTrue(history)
+        self.assertTrue(all(d == learned_dof for d in history))
 
 
 class TestDofLearningStability(unittest.TestCase):

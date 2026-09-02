@@ -104,12 +104,13 @@ for a fixed ``dof``.
 
 .. note::
 
-    Learning the degrees of freedom is currently supported only with the
-    Barnes-Hut gradient (``negative_gradient_method="bh"``) and is unsupported
-    with the interpolation-based (FFT) gradient, where ``dof="auto"`` keeps the
-    degrees of freedom fixed and emits a warning. Barnes-Hut is selected
-    automatically for small data sets and is always used for embeddings with
-    three or more dimensions.
+    Learning the degrees of freedom is supported with both the Barnes-Hut
+    (``negative_gradient_method="bh"``) and the interpolation-based FFT
+    (``negative_gradient_method="fft"``) gradients. The one exception is
+    embedding new points into an existing embedding
+    (:meth:`~openTSNE.TSNEEmbedding.transform`): there only Barnes-Hut computes
+    the dof gradient, and the FFT path keeps the degrees of freedom fixed and
+    emits a warning.
 
 Optimizing in phases
 ~~~~~~~~~~~~~~~~~~~~~~
