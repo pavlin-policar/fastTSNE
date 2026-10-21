@@ -610,11 +610,10 @@ class TSNEEmbedding(np.ndarray):
         Degrees of freedom as described in Kobak et al. "Heavy-tailed kernels
         reveal a finer cluster structure in t-SNE visualisations", 2019.
         If ``dof="auto"``, the degrees of freedom are learned during
-        optimization (only supported with ``negative_gradient_method="bh"``;
-        the FFT path will warn and keep dof fixed). The optimizer warm-starts
-        from the embedding's current ``dof_`` if set, otherwise from
-        ``initial_dof``, otherwise from 1.0. The latest learned value is
-        written back to ``embedding.dof_``.
+        optimization, with either the Barnes-Hut or the FFT negative gradient
+        method. The optimizer warm-starts from the embedding's current
+        ``dof_`` if set, otherwise from ``initial_dof``, otherwise from 1.0.
+        The latest learned value is written back to ``embedding.dof_``.
 
     initial_dof: Optional[float]
         Starting value for the learnable degrees of freedom when
@@ -797,12 +796,11 @@ class TSNEEmbedding(np.ndarray):
             Degrees of freedom as described in Kobak et al. "Heavy-tailed
             kernels reveal a finer cluster structure in t-SNE visualisations",
             2019. If ``dof="auto"``, the degrees of freedom are learned
-            during optimization (only supported with
-            ``negative_gradient_method="bh"``; the FFT path will warn and keep
-            dof fixed). The optimizer warm-starts from the embedding's current
-            ``dof_`` if set, otherwise from ``initial_dof``, otherwise from
-            1.0. The latest learned value is written back to
-            ``embedding.dof_``.
+            during optimization, with either the Barnes-Hut or the FFT
+            negative gradient method. The optimizer warm-starts from the
+            embedding's current ``dof_`` if set, otherwise from
+            ``initial_dof``, otherwise from 1.0. The latest learned value is
+            written back to ``embedding.dof_``.
 
         initial_dof: Optional[float]
             Starting value for the learnable degrees of freedom when
