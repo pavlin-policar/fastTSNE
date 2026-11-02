@@ -440,6 +440,17 @@ class TestDofAutoLearning(unittest.TestCase):
         self.assertGreater(len(history), 0)
         self.assertEqual(history[0].dof, 5.0)
 
+    def test_auto_dof_rejects_invalid_initial_dof(self):
+        for bad in (0, -1.0, np.nan, np.inf, "5"):
+            with self.subTest(initial_dof=bad):
+                with self.assertRaisesRegex(ValueError, "initial_dof"):
+                    TSNE_BH(
+                        dof="auto",
+                        initial_dof=bad,
+                        early_exaggeration_iter=0,
+                        n_iter=1,
+                    ).fit(self.x)
+
     def test_fixed_then_auto_resumes_from_fixed(self):
         # Switching from a fixed dof to dof="auto" must pick up at the fixed
         # value, so the user can use a fixed-dof phase as a warm start for

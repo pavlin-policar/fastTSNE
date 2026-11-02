@@ -2337,6 +2337,16 @@ class gradient_descent:
             start_time = time()
 
         if dof == "auto":
+            if initial_dof is not None:
+                try:
+                    valid = bool(np.isfinite(initial_dof) and initial_dof > 0)
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    raise ValueError(
+                        "`initial_dof` must be a positive, finite number; got "
+                        f"{initial_dof!r}."
+                    )
             if "dof" not in self.optimizers:
                 # Cap the gain at 1 to prevent runaway, unrecoverable dof during
                 # exaggerated phases of the optimization
