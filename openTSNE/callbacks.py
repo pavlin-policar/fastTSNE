@@ -47,20 +47,28 @@ class VerifyExaggerationError(Callback):
     def __call__(self, state: IterationState):
         params = self.embedding.gradient_descent_params
         method = params["negative_gradient_method"]
+        if method == "auto":
+            # Mirrors the size threshold the optimizer uses for "auto"
+            method = "bh" if state.embedding.shape[0] < 10_000 else "fft"
 
-        if method == "fft":
+        if method in {"fft", "FFT", "interpolation"}:
             f = partial(
                 kl_divergence.kl_divergence_approx_fft,
                 n_interpolation_points=params["n_interpolation_points"],
                 min_num_intervals=params["min_num_intervals"],
                 ints_in_interval=params["ints_in_interval"],
-                dof=params["dof"],
+                dof=state.dof,
             )
-        elif method == "bh":
+        elif method in {"bh", "BH", "barnes-hut"}:
             f = partial(
                 kl_divergence.kl_divergence_approx_bh,
                 theta=params["theta"],
-                dof=params["dof"],
+                dof=state.dof,
+            )
+        else:
+            raise ValueError(
+                "`VerifyExaggerationError` supports only the built-in negative "
+                "gradient methods; got %r." % (method,)
             )
 
         P = self.P
@@ -87,12 +95,14 @@ class ErrorApproximations(Callback):
 
     def __call__(self, state: IterationState):
         embedding = state.embedding
-        exact_error = kl_divergence.kl_divergence_exact(self.P.toarray(), embedding)
+        exact_error = kl_divergence.kl_divergence_exact(
+            self.P.toarray(), embedding, dof=state.dof
+        )
         bh_error = kl_divergence.kl_divergence_approx_bh(
-            self.P.indices, self.P.indptr, self.P.data, embedding
+            self.P.indices, self.P.indptr, self.P.data, embedding, dof=state.dof
         )
         fft_error = kl_divergence.kl_divergence_approx_fft(
-            self.P.indices, self.P.indptr, self.P.data, embedding
+            self.P.indices, self.P.indptr, self.P.data, embedding, dof=state.dof
         )
 
         self.exact_errors.append(exact_error)

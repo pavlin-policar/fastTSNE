@@ -7,7 +7,7 @@ import openTSNE
 import openTSNE.affinity
 import openTSNE.initialization
 import numpy as np
-from openTSNE.callbacks import VerifyExaggerationError
+from openTSNE.callbacks import ErrorApproximations, VerifyExaggerationError
 from sklearn import datasets
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
@@ -59,6 +59,36 @@ class TestTSNECorrectness(unittest.TestCase):
             callbacks=[VerifyExaggerationError(embedding)],
             callbacks_every_iters=1,
             inplace=True,
+        )
+
+    def test_error_exaggeration_correction_with_learned_dof(self):
+        for method in ("bh", "fft", "auto"):
+            with self.subTest(method=method):
+                tsne = openTSNE.TSNE(
+                    neighbors="exact", negative_gradient_method=method, dof="auto"
+                )
+                embedding = tsne.prepare_initial(self.x)
+                embedding.optimize(
+                    10,
+                    exaggeration=5,
+                    callbacks=[VerifyExaggerationError(embedding)],
+                    callbacks_every_iters=1,
+                    inplace=True,
+                )
+                self.assertNotEqual(embedding.dof_, 1)
+
+    def test_error_approximations_use_the_iteration_dof(self):
+        embedding = TSNE(dof=5, early_exaggeration_iter=0, n_iter=20).fit(self.x)
+        approximations = ErrorApproximations(embedding.affinities.P)
+        states = []
+        embedding.optimize(
+            3,
+            callbacks=[approximations, states.append],
+            callbacks_every_iters=1,
+            inplace=True,
+        )
+        np.testing.assert_allclose(
+            approximations.bh_errors, [s.error for s in states], rtol=1e-10
         )
 
     def test_iris(self):
