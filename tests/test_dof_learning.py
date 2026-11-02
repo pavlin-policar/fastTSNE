@@ -1050,6 +1050,31 @@ class TestOptimizationItersTracking(unittest.TestCase):
         )
         self.assertEqual(history[0].dof, 5.0)
 
+    def test_interrupt_counts_only_applied_updates(self):
+        embedding = TSNE_BH(early_exaggeration_iter=0, n_iter=4).fit(self.x)
+        before = np.array(embedding)
+
+        stopped = embedding.optimize(
+            5, callbacks=lambda state: True, callbacks_every_iters=1
+        )
+        np.testing.assert_array_equal(stopped, before)
+        self.assertEqual(stopped.optimization_iters_, 4)
+
+        seen = []
+
+        def stop_at_third(state):
+            seen.append(state.embedding.optimization_iters_)
+            return state.iteration == 3
+
+        stopped = embedding.optimize(
+            5, callbacks=stop_at_third, callbacks_every_iters=1
+        )
+        self.assertEqual(stopped.optimization_iters_, 6)
+        stopped.optimize(1, inplace=True, callbacks=stop_at_third,
+                         callbacks_every_iters=1)
+        # The interrupted iteration is evaluated again, under the same index
+        self.assertEqual(seen, [5, 6, 7, 7])
+
     def test_callback_sees_monotonic_global_counter(self):
         # The snapshot's optimization_iters_ must increase monotonically across
         # consecutive optimize() calls so callbacks can plot a continuous

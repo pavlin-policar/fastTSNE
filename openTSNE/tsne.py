@@ -64,7 +64,11 @@ class IterationState:
         along with the affinities, parameters, and optimizer state, so it can
         be optimized further or pickled. Retaining the snapshot after the
         callback returns is safe — it is a copy, not the live optimizer state;
-        only the affinities are shared with the running optimization.
+        only the affinities are shared with the running optimization. The
+        snapshot's ``optimization_iters_`` is the cumulative 1-based index of
+        this iteration, whose update is applied after the callbacks return; if
+        a callback interrupts the optimization, the update is skipped and the
+        returned embedding does not count it.
 
     gradient: np.ndarray
         The raw gradient produced by the objective function this iteration,
@@ -2524,7 +2528,9 @@ class gradient_descent:
                     if exaggeration != 1:
                         P /= exaggeration
                     embedding.dof_ = dof_
-                    embedding.optimization_iters_ = initial_iter + iteration + 1
+                    # Callbacks run before this iteration's update, which is
+                    # skipped, so it is not counted
+                    embedding.optimization_iters_ = initial_iter + iteration
                     raise OptimizationInterrupt(error=error, final_embedding=embedding)
 
             if dof == "auto":
