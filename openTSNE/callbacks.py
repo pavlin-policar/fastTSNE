@@ -5,7 +5,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 from openTSNE import kl_divergence
-from openTSNE.tsne import TSNEEmbedding
+from openTSNE.tsne import IterationState, TSNEEmbedding
 
 log = logging.getLogger(__name__)
 
@@ -14,19 +14,17 @@ class Callback:
     def optimization_about_to_start(self):
         """This is called at the beginning of the optimization procedure."""
 
-    def __call__(self, iteration, error, embedding):
+    def __call__(self, state: IterationState):
         """This is the main method called from the optimization.
 
         Parameters
         ----------
-        iteration: int
-            The current iteration number.
-
-        error: float
-            The current KL divergence of the given embedding.
-
-        embedding: TSNEEmbedding
-            The current t-SNE embedding.
+        state: IterationState
+            Per-iteration snapshot containing the iteration number, the current
+            embedding and gradient (both copies), the error, the current
+            exaggeration factor, and the degrees-of-freedom value and gradient.
+            See :class:`openTSNE.tsne.IterationState` for the full list of
+            fields.
 
         Returns
         -------
@@ -46,39 +44,42 @@ class VerifyExaggerationError(Callback):
         # Keep a copy of the unexaggerated affinity matrix
         self.P = self.embedding.affinities.P.copy()
 
-    def __call__(
-        self, iteration: int, corrected_error: float, embedding: TSNEEmbedding
-    ):
+    def __call__(self, state: IterationState):
         params = self.embedding.gradient_descent_params
         method = params["negative_gradient_method"]
+        if method == "auto":
+            # Mirrors the size threshold the optimizer uses for "auto"
+            method = "bh" if state.embedding.shape[0] < 10_000 else "fft"
 
-        if np.sum(embedding.affinities.P) <= 1:
-            log.warning("Are you sure you are testing an exaggerated P matrix?")
-
-        if method == "fft":
+        if method in {"fft", "FFT", "interpolation"}:
             f = partial(
                 kl_divergence.kl_divergence_approx_fft,
                 n_interpolation_points=params["n_interpolation_points"],
                 min_num_intervals=params["min_num_intervals"],
                 ints_in_interval=params["ints_in_interval"],
-                dof=params["dof"],
+                dof=state.dof,
             )
-        elif method == "bh":
+        elif method in {"bh", "BH", "barnes-hut"}:
             f = partial(
                 kl_divergence.kl_divergence_approx_bh,
                 theta=params["theta"],
-                dof=params["dof"],
+                dof=state.dof,
+            )
+        else:
+            raise ValueError(
+                "`VerifyExaggerationError` supports only the built-in negative "
+                "gradient methods; got %r." % (method,)
             )
 
         P = self.P
 
-        true_error = f(P.indices, P.indptr, P.data, embedding)
-        if abs(true_error - corrected_error) > 1e-8:
+        true_error = f(P.indices, P.indptr, P.data, state.embedding)
+        if abs(true_error - state.error) > 1e-8:
             raise RuntimeError("Correction term is wrong.")
         else:
             log.info(
                 "Corrected: %.4f - True %.4f [eps %.4f]"
-                % (corrected_error, true_error, abs(true_error - corrected_error))
+                % (state.error, true_error, abs(true_error - state.error))
             )
 
 
@@ -92,13 +93,16 @@ class ErrorApproximations(Callback):
         self.bh_errors = []
         self.fft_errors = []
 
-    def __call__(self, iteration: int, error: float, embedding: TSNEEmbedding):
-        exact_error = kl_divergence.kl_divergence_exact(self.P.toarray(), embedding)
+    def __call__(self, state: IterationState):
+        embedding = state.embedding
+        exact_error = kl_divergence.kl_divergence_exact(
+            self.P.toarray(), embedding, dof=state.dof
+        )
         bh_error = kl_divergence.kl_divergence_approx_bh(
-            self.P.indices, self.P.indptr, self.P.data, embedding
+            self.P.indices, self.P.indptr, self.P.data, embedding, dof=state.dof
         )
         fft_error = kl_divergence.kl_divergence_approx_fft(
-            self.P.indices, self.P.indptr, self.P.data, embedding
+            self.P.indices, self.P.indptr, self.P.data, embedding, dof=state.dof
         )
 
         self.exact_errors.append(exact_error)

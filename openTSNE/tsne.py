@@ -3,22 +3,225 @@ import logging
 import multiprocessing
 import warnings
 from collections.abc import Iterable
-from types import SimpleNamespace
+from dataclasses import dataclass
 from time import time
+from types import SimpleNamespace
 
 import numpy as np
 from sklearn.base import BaseEstimator
 
-from openTSNE import _tsne
+from openTSNE import _tsne, utils
 from openTSNE import initialization as initialization_scheme
 from openTSNE.affinity import Affinities, MultiscaleMixture
+from openTSNE.optimizer import (
+    DeltaBarDeltaOptimizer,
+    clip_gradient_norm,
+    clip_step_norm,
+)
 from openTSNE.quad_tree import QuadTree
-from openTSNE import utils
-
 
 EPSILON = np.finfo(np.float64).eps
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class GradientResult:
+    """Result of a single objective-function evaluation."""
+
+    error: float
+    gradient: np.ndarray
+    dof_grad: float = 0.0
+
+
+@dataclass
+class IterationState:
+    """Per-iteration snapshot passed to optimization callbacks.
+
+    Constructed only when a callback fires, and contains copies of the
+    embedding and gradient so callbacks can safely retain the state.
+
+    Attributes
+    ----------
+    iteration: int
+        The 1-based index of the current iteration *within the active*
+        :func:`optimize` *call*. It always runs from 1 to ``n_iter`` and
+        resets at the start of each new :func:`optimize` call. Use this
+        when you want a per-call milestone (e.g. ``state.iteration == n_iter``
+        to detect the last iteration of a phase). For a global counter that
+        accumulates across consecutive :func:`optimize` calls, read
+        ``state.embedding.optimization_iters_`` instead — that is the right
+        choice when plotting trajectories across an early-exaggeration phase
+        and the main optimization phase, or across any chained
+        :func:`optimize` calls.
+
+    exaggeration: float
+        The exaggeration factor in effect for this iteration.
+
+    embedding: TSNEEmbedding or PartialTSNEEmbedding
+        A snapshot of the embedding at the current iteration. The embedding
+        carries its current ``dof_`` and ``optimization_iters_`` attributes,
+        along with the affinities, parameters, and optimizer state, so it can
+        be optimized further or pickled. Retaining the snapshot after the
+        callback returns is safe — it is a copy, not the live optimizer state;
+        only the affinities are shared with the running optimization. The
+        snapshot's ``optimization_iters_`` is the cumulative 1-based index of
+        this iteration, whose update is applied after the callbacks return; if
+        a callback interrupts the optimization, the update is skipped and the
+        returned embedding does not count it.
+
+    gradient: np.ndarray
+        The raw gradient produced by the objective function this iteration,
+        before any in-place gradient clipping the optimizer may apply.
+
+    error: float
+        The KL divergence at this iteration. Computed only on iterations
+        where the callback fires (and additionally on logging iterations
+        when ``verbose=True``); on other iterations this field is stale.
+
+    dof: float
+        The degrees-of-freedom value used by the kernel this iteration.
+        Equal to the fixed ``dof`` parameter for fixed-dof runs, and to the
+        currently-learned value when ``dof="auto"``.
+
+    dof_grad: float
+        The gradient of the loss with respect to ``dof``. Zero for
+        fixed-dof runs, and when optimizing against a fixed reference
+        embedding under the FFT objective, which does not compute the dof
+        gradient in that case.
+    """
+
+    iteration: int
+    exaggeration: float
+    embedding: np.ndarray
+    gradient: np.ndarray
+    error: float
+    dof: float
+    dof_grad: float
+
+
+def _snapshot_embedding(embedding, dof, optimization_iters):
+    """Copy an embedding together with its metadata for a callback.
+
+    The copy can be retained, re-optimized, or pickled. Affinities and the
+    reference embedding are shared with the original; the optimizer state and
+    the parameter dict are copied, since the running optimization mutates them.
+    """
+    snapshot = embedding.copy()
+    snapshot.__dict__.update(getattr(embedding, "__dict__", {}))
+    if hasattr(embedding, "optimizer"):
+        snapshot.optimizer = embedding.optimizer.copy()
+    if hasattr(embedding, "gradient_descent_params"):
+        snapshot.gradient_descent_params = dict(embedding.gradient_descent_params)
+    snapshot.dof_ = dof
+    snapshot.optimization_iters_ = optimization_iters
+    return snapshot
+
+
+def _adapt_callback(c):
+    """Wrap a user callback so the optimizer can always invoke it as `c(state)`.
+
+    Old-style 3-arg callbacks `c(iteration, error, embedding)` are still
+    accepted but emit a FutureWarning at registration time. A callback that
+    has at least three positional parameters and can be called with three
+    arguments is treated as old-style, since that is how it was called before
+    `IterationState` existed; one that can be called with a single argument
+    is new-style.
+    """
+    try:
+        sig = inspect.signature(c)
+    except (TypeError, ValueError):
+        # Builtins or C-extensions without introspectable signatures: assume new style.
+        return c
+
+    positional = [
+        p for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    n_positional = len(positional)
+    n_required = sum(p.default is inspect.Parameter.empty for p in positional)
+    accepts_var_positional = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+    )
+
+    if n_required <= 1 and (n_positional in (1, 2) or (
+        n_positional == 0 and accepts_var_positional
+    )):
+        return c
+    if n_required <= 3 <= n_positional or (
+        2 <= n_required <= 3 and accepts_var_positional
+    ):
+        warnings.warn(
+            "Callbacks taking (iteration, error, embedding) are deprecated and "
+            "will be removed in a future release. Switch to a single-argument "
+            "callback `callback(state: IterationState)` to access the full "
+            "per-iteration state (including dof, gradient, exaggeration, etc.).",
+            FutureWarning,
+            stacklevel=3,
+        )
+
+        def wrapped(state, _c=c):
+            return _c(state.iteration, state.error, state.embedding)
+
+        # Preserve the optimization_about_to_start hook (used by class-based
+        # callbacks subclassing `Callback`) so it still fires through the wrapper.
+        if hasattr(c, "optimization_about_to_start"):
+            wrapped.optimization_about_to_start = c.optimization_about_to_start
+        return wrapped
+    raise TypeError(
+        "Callback must accept either a single IterationState argument or the "
+        "deprecated (iteration, error, embedding) signature; got a callable "
+        f"requiring {n_required} positional arguments."
+    )
+
+
+def _adapt_objective(objective_function):
+    """Wrap a user-supplied objective function so the optimizer can call it
+    like the built-in ones.
+
+    ``compute_dof_grad`` is passed on only if the objective accepts it. An
+    objective returning an ``(error, gradient)`` tuple is still accepted with a
+    FutureWarning, but since it provides no dof gradient, it cannot be used
+    with ``dof="auto"``.
+    """
+    try:
+        parameters = inspect.signature(objective_function).parameters.values()
+        accepts_compute_dof_grad = any(
+            p.name == "compute_dof_grad" or p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in parameters
+        )
+    except (TypeError, ValueError):
+        accepts_compute_dof_grad = True
+    warned = False
+
+    def wrapped(*args, compute_dof_grad=False, **kwargs):
+        nonlocal warned
+        if accepts_compute_dof_grad:
+            kwargs["compute_dof_grad"] = compute_dof_grad
+        result = objective_function(*args, **kwargs)
+        if isinstance(result, GradientResult):
+            return result
+
+        if compute_dof_grad:
+            raise ValueError(
+                "`dof='auto'` requires the objective function to return an "
+                "`openTSNE.tsne.GradientResult` that includes the dof gradient, "
+                "but it returned %s." % type(result).__name__
+            )
+        if not warned:
+            warnings.warn(
+                "Objective functions returning an (error, gradient) tuple are "
+                "deprecated and will not be supported in a future release. "
+                "Return an `openTSNE.tsne.GradientResult` instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            warned = True
+        error, gradient = result
+        return GradientResult(error=error, gradient=gradient)
+
+    return wrapped
 
 
 def _check_callbacks(callbacks):
@@ -29,9 +232,11 @@ def _check_callbacks(callbacks):
                 raise ValueError("`callbacks` must contain callable objects!")
         # The gradient descent method deals with lists
         elif callable(callbacks):
-            callbacks = (callbacks,)
+            callbacks = [callbacks]
         else:
             raise ValueError("`callbacks` must be a callable object!")
+
+        callbacks = [_adapt_callback(c) for c in callbacks]
 
     return callbacks
 
@@ -56,7 +261,8 @@ def _handle_nice_params(embedding: np.ndarray, optim_params: dict) -> None:
         )
 
     if callable(negative_gradient_method):
-        negative_gradient_method = negative_gradient_method
+        if negative_gradient_method not in (kl_divergence_bh, kl_divergence_fft):
+            negative_gradient_method = _adapt_objective(negative_gradient_method)
     elif negative_gradient_method in {"bh", "BH", "barnes-hut"}:
         negative_gradient_method = kl_divergence_bh
     elif negative_gradient_method in {"fft", "FFT", "interpolation"}:
@@ -117,7 +323,8 @@ def __check_init_num_dimensions(num_dimensions, required_num_dimensions):
 
 
 init_checks = SimpleNamespace(
-    num_samples=__check_init_num_samples, num_dimensions=__check_init_num_dimensions,
+    num_samples=__check_init_num_samples,
+    num_dimensions=__check_init_num_dimensions,
 )
 
 
@@ -169,7 +376,7 @@ class PartialTSNEEmbedding(np.ndarray):
         the appropriate learning rate is selected according to N / exaggeration
         as determined in Belkina et al. (2019), Nature Communications. Note that
         this will result in a different learning rate during the early
-        exaggeration phase and afterwards. This should *not* be used when 
+        exaggeration phase and afterwards. This should *not* be used when
         adding samples into existing embeddings, where the learning rate often
         needs to be much lower to obtain convergence.
 
@@ -220,8 +427,16 @@ class PartialTSNEEmbedding(np.ndarray):
         scikit-learn convention, ``-1`` meaning all processors, ``-2`` meaning
         all but one, etc.
 
-    callbacks: Callable[[int, float, np.ndarray] -> bool]
+    callbacks: Callable[[IterationState], bool]
         Callbacks, which will be run every ``callbacks_every_iters`` iterations.
+        Each callback receives an :class:`IterationState` snapshot — see that
+        class for the available fields and the distinction between the
+        per-call ``state.iteration`` counter and the cumulative
+        ``state.embedding.optimization_iters_`` counter. Returning ``True``
+        from any callback will interrupt the optimization. The legacy
+        three-argument signature ``callback(iteration, error, embedding)`` is
+        still accepted but emits a ``FutureWarning`` and will be removed in a
+        future release.
 
     callbacks_every_iters: int
         How many iterations should pass between each time the callbacks are
@@ -234,8 +449,23 @@ class PartialTSNEEmbedding(np.ndarray):
 
     Attributes
     ----------
-    kl_divergence: float
+    kl_divergence_: float
         The KL divergence or error of the embedding.
+
+    dof_: float or None
+        The degrees-of-freedom the embedding was last optimized with. See
+        :class:`IterationState` for details.
+
+    optimization_iters_: int
+        The total number of optimization iterations this embedding has
+        been through, accumulated across consecutive :func:`optimize`
+        calls. See :class:`IterationState` for details.
+
+    Notes
+    -----
+    The attribute ``kl_divergence`` (without trailing underscore) is
+    deprecated and will be removed in a future release. Use
+    ``kl_divergence_`` instead.
 
     """
 
@@ -249,7 +479,9 @@ class PartialTSNEEmbedding(np.ndarray):
     ):
         init_checks.num_samples(embedding.shape[0], P.shape[0])
 
-        obj = np.array(embedding, dtype=np.float64, order="C").view(PartialTSNEEmbedding)
+        obj = np.array(embedding, dtype=np.float64, order="C").view(
+            PartialTSNEEmbedding
+        )
 
         obj.reference_embedding = reference_embedding
         obj.P = P
@@ -264,7 +496,13 @@ class PartialTSNEEmbedding(np.ndarray):
             )
         obj.optimizer = optimizer
 
-        obj.kl_divergence = None
+        obj.kl_divergence_ = None
+        # Mirror the parent embedding's behavior: a fixed dof is reflected on
+        # the embedding immediately; `dof="auto"` stays as None until the
+        # optimizer warm-starts.
+        partial_dof = gradient_descent_params.get("dof")
+        obj.dof_ = partial_dof if isinstance(partial_dof, (int, float)) else None
+        obj.optimization_iters_ = 0
 
         return obj
 
@@ -342,9 +580,16 @@ class PartialTSNEEmbedding(np.ndarray):
             scikit-learn convention, ``-1`` meaning all processors, ``-2``
             meaning all but one, etc.
 
-        callbacks: Callable[[int, float, np.ndarray] -> bool]
+        callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
-            iterations.
+            iterations. Each callback receives an :class:`IterationState`
+            snapshot — see that class for the available fields and the
+            distinction between the per-call ``state.iteration`` counter and
+            the cumulative ``state.embedding.optimization_iters_`` counter.
+            Returning ``True`` from any callback will interrupt the
+            optimization. The legacy three-argument signature
+            ``callback(iteration, error, embedding)`` is still accepted but
+            emits a ``FutureWarning`` and will be removed in a future release.
 
         callbacks_every_iters: int
             How many iterations should pass between each time the callbacks are
@@ -373,6 +618,8 @@ class PartialTSNEEmbedding(np.ndarray):
                 optimizer=self.optimizer.copy(),
                 **self.gradient_descent_params,
             )
+            embedding.dof_ = self.dof_
+            embedding.optimization_iters_ = self.optimization_iters_
 
         # If optimization parameters were passed to this funciton, prefer those
         # over the defaults specified in the TSNE object
@@ -397,9 +644,19 @@ class PartialTSNEEmbedding(np.ndarray):
                 raise ex
             error, embedding = ex.error, ex.final_embedding
 
-        embedding.kl_divergence = error
+        embedding.kl_divergence_ = error
 
         return embedding
+
+    @property
+    def kl_divergence(self):
+        warnings.warn(
+            "The `kl_divergence` attribute is deprecated and will be removed "
+            "in a future release. Use `kl_divergence_` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.kl_divergence_
 
 
 class TSNEEmbedding(np.ndarray):
@@ -422,7 +679,7 @@ class TSNEEmbedding(np.ndarray):
         the appropriate learning rate is selected according to N / exaggeration
         as determined in Belkina et al. (2019), Nature Communications. Note that
         this will result in a different learning rate during the early
-        exaggeration phase and afterwards. This should *not* be used when 
+        exaggeration phase and afterwards. This should *not* be used when
         adding samples into existing embeddings, where the learning rate often
         needs to be much lower to obtain convergence.
 
@@ -430,9 +687,20 @@ class TSNEEmbedding(np.ndarray):
         The exaggeration factor is used to increase the attractive forces of
         nearby points, producing more compact clusters.
 
-    dof: float
+    dof: Union[float, str]
         Degrees of freedom as described in Kobak et al. "Heavy-tailed kernels
         reveal a finer cluster structure in t-SNE visualisations", 2019.
+        If ``dof="auto"``, the degrees of freedom are learned during
+        optimization, with either the Barnes-Hut or the FFT negative gradient
+        method. The optimizer warm-starts from the embedding's current
+        ``dof_`` if set, otherwise from ``initial_dof``, otherwise from 1.0.
+        The latest learned value is written back to ``embedding.dof_``.
+
+    initial_dof: Optional[float]
+        Starting value for the learnable degrees of freedom when
+        ``dof="auto"`` and the embedding has no prior ``dof_`` set. Ignored
+        otherwise (and a warning is emitted if given alongside a fixed
+        ``dof``).
 
     momentum: float
         Momentum accounts for gradient directions from previous iterations,
@@ -480,8 +748,16 @@ class TSNEEmbedding(np.ndarray):
         scikit-learn convention, ``-1`` meaning all processors, ``-2`` meaning
         all but one, etc.
 
-    callbacks: Callable[[int, float, np.ndarray] -> bool]
+    callbacks: Callable[[IterationState], bool]
         Callbacks, which will be run every ``callbacks_every_iters`` iterations.
+        Each callback receives an :class:`IterationState` snapshot — see that
+        class for the available fields and the distinction between the
+        per-call ``state.iteration`` counter and the cumulative
+        ``state.embedding.optimization_iters_`` counter. Returning ``True``
+        from any callback will interrupt the optimization. The legacy
+        three-argument signature ``callback(iteration, error, embedding)`` is
+        still accepted but emits a ``FutureWarning`` and will be removed in a
+        future release.
 
     callbacks_every_iters: int
         How many iterations should pass between each time the callbacks are
@@ -494,8 +770,23 @@ class TSNEEmbedding(np.ndarray):
 
     Attributes
     ----------
-    kl_divergence: float
+    kl_divergence_: float
         The KL divergence or error of the embedding.
+
+    dof_: float or None
+        The degrees-of-freedom the embedding was last optimized with. See
+        :class:`IterationState` for details.
+
+    optimization_iters_: int
+        The total number of optimization iterations this embedding has
+        been through, accumulated across consecutive :func:`optimize`
+        calls. See :class:`IterationState` for details.
+
+    Notes
+    -----
+    The attribute ``kl_divergence`` (without trailing underscore) is
+    deprecated and will be removed in a future release. Use
+    ``kl_divergence_`` instead.
 
     """
 
@@ -518,13 +809,15 @@ class TSNEEmbedding(np.ndarray):
 
         obj.affinities = affinities  # type: Affinities
         obj.gradient_descent_params = gradient_descent_params  # type: dict
-        obj.gradient_descent_params.update({
-            "negative_gradient_method": negative_gradient_method,
-            "n_interpolation_points": n_interpolation_points,
-            "min_num_intervals": min_num_intervals,
-            "ints_in_interval": ints_in_interval,
-            "dof": dof,
-        })
+        obj.gradient_descent_params.update(
+            {
+                "negative_gradient_method": negative_gradient_method,
+                "n_interpolation_points": n_interpolation_points,
+                "min_num_intervals": min_num_intervals,
+                "ints_in_interval": ints_in_interval,
+                "dof": dof,
+            }
+        )
         obj.random_state = random_state
 
         if optimizer is None:
@@ -536,13 +829,18 @@ class TSNEEmbedding(np.ndarray):
             )
         obj.optimizer = optimizer
 
-        obj.kl_divergence = None
+        obj.kl_divergence_ = None
+        # Reflect the requested dof on the embedding immediately. For fixed
+        # dof, this matches the value the optimizer will use; for `dof="auto"`,
+        # leave it as None so the optimizer can warm-start from
+        # `initial_dof`/1.0 on first run.
+        obj.dof_ = dof if isinstance(dof, (int, float)) else None
+        obj.optimization_iters_ = 0
 
         # Interpolation grid variables
         obj.interp_coeffs = None
         obj.box_x_lower_bounds = None
         obj.box_y_lower_bounds = None
-
         return obj
 
     def optimize(
@@ -575,9 +873,21 @@ class TSNEEmbedding(np.ndarray):
             The exaggeration factor is used to increase the attractive forces of
             nearby points, producing more compact clusters.
 
-        dof: float
-            Degrees of freedom as described in Kobak et al. "Heavy-tailed kernels
-            reveal a finer cluster structure in t-SNE visualisations", 2019.
+        dof: Union[float, str]
+            Degrees of freedom as described in Kobak et al. "Heavy-tailed
+            kernels reveal a finer cluster structure in t-SNE visualisations",
+            2019. If ``dof="auto"``, the degrees of freedom are learned
+            during optimization, with either the Barnes-Hut or the FFT
+            negative gradient method. The optimizer warm-starts from the
+            embedding's current ``dof_`` if set, otherwise from
+            ``initial_dof``, otherwise from 1.0. The latest learned value is
+            written back to ``embedding.dof_``.
+
+        initial_dof: Optional[float]
+            Starting value for the learnable degrees of freedom when
+            ``dof="auto"`` and the embedding has no prior ``dof_`` set.
+            Ignored otherwise (and a warning is emitted if given alongside a
+            fixed ``dof``).
 
         momentum: float
             Momentum accounts for gradient directions from previous iterations,
@@ -638,9 +948,16 @@ class TSNEEmbedding(np.ndarray):
             scikit-learn convention, ``-1`` meaning all processors, ``-2``
             meaning all but one, etc.
 
-        callbacks: Callable[[int, float, np.ndarray] -> bool]
+        callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
-            iterations.
+            iterations. Each callback receives an :class:`IterationState`
+            snapshot — see that class for the available fields and the
+            distinction between the per-call ``state.iteration`` counter and
+            the cumulative ``state.embedding.optimization_iters_`` counter.
+            Returning ``True`` from any callback will interrupt the
+            optimization. The legacy three-argument signature
+            ``callback(iteration, error, embedding)`` is still accepted but
+            emits a ``FutureWarning`` and will be removed in a future release.
 
         callbacks_every_iters: int
             How many iterations should pass between each time the callbacks are
@@ -669,6 +986,8 @@ class TSNEEmbedding(np.ndarray):
                 optimizer=self.optimizer.copy(),
                 **self.gradient_descent_params,
             )
+            embedding.dof_ = self.dof_
+            embedding.optimization_iters_ = self.optimization_iters_
 
         # If optimization parameters were passed to this funciton, prefer those
         # over the defaults specified in the TSNE object
@@ -690,7 +1009,7 @@ class TSNEEmbedding(np.ndarray):
                 raise ex
             error, embedding = ex.error, ex.final_embedding
 
-        embedding.kl_divergence = error
+        embedding.kl_divergence_ = error
 
         return embedding
 
@@ -709,6 +1028,8 @@ class TSNEEmbedding(np.ndarray):
         final_momentum=0.8,
         max_grad_norm=0.25,
         max_step_norm=None,
+        dof="inherit",
+        initial_dof=None,
     ):
         """Embed new points into the existing embedding.
 
@@ -743,7 +1064,7 @@ class TSNEEmbedding(np.ndarray):
             initial point positions.
 
         learning_rate: Union[str, float]
-            The learning rate for t-SNE optimization. When 
+            The learning rate for t-SNE optimization. When
             ``learning_rate="auto"`` the appropriate learning rate is selected
             according to N / exaggeration as determined in Belkina et al.
             (2019), Nature Communications. Note that this will result in a
@@ -786,6 +1107,27 @@ class TSNEEmbedding(np.ndarray):
             clipped. This prevents points from "shooting off" from
             the embedding.
 
+        dof: Union[float, str]
+            Degrees of freedom for the new points. One of:
+
+            - ``"inherit"`` (default): pin dof at the parent embedding's
+              effective dof so the new points live in the same kernel as the
+              reference. Almost always the right choice.
+            - ``"auto"``: learn dof for the new points independently of the
+              parent. Warm-starts from ``initial_dof`` if given, otherwise
+              from the parent's learned dof, otherwise from 1.0. This is
+              uncharted territory and should be used at your own risk: against a
+              fixed reference the objective has no interior optimum in dof (it
+              decreases monotonically, with sharply diminishing returns, as dof
+              grows), so the learned value drifts upward with more iterations
+              rather than settling, and a warning is emitted. ``"inherit"`` (the
+              default) is recommended.
+            - a float: pin dof at that fixed value.
+
+        initial_dof: Optional[float]
+            Starting value for the learnable dof when ``dof="auto"``. Ignored
+            otherwise.
+
         Returns
         -------
         PartialTSNEEmbedding
@@ -812,7 +1154,12 @@ class TSNEEmbedding(np.ndarray):
         self -= (np.max(self, axis=0) + np.min(self, axis=0)) / 2
 
         embedding = self.prepare_partial(
-            X, initialization=initialization, k=k, **affinity_params
+            X,
+            initialization=initialization,
+            k=k,
+            dof=dof,
+            initial_dof=initial_dof,
+            **affinity_params,
         )
 
         try:
@@ -843,7 +1190,15 @@ class TSNEEmbedding(np.ndarray):
 
         return embedding
 
-    def prepare_partial(self, X, initialization="median", k=25, **affinity_params):
+    def prepare_partial(
+        self,
+        X,
+        initialization="median",
+        k=25,
+        dof="inherit",
+        initial_dof=None,
+        **affinity_params,
+    ):
         """Prepare a partial embedding which can be optimized.
 
         Parameters
@@ -863,6 +1218,27 @@ class TSNEEmbedding(np.ndarray):
             because perplexity affects optimization while this only affects the
             initial point positions.
 
+        dof: Union[float, str]
+            Degrees of freedom for the partial embedding. One of:
+
+            - ``"inherit"`` (default): pin dof at the parent embedding's
+              effective dof (``parent.dof_``), so the new points live in the
+              same kernel as the reference. This is almost always what you
+              want.
+            - ``"auto"``: learn dof for the partial embedding independently of
+              the parent. Warm-starts from ``initial_dof`` if given, otherwise
+              from ``parent.dof_`` if available, otherwise from 1.0. Note that
+              dof is only weakly identified here: with the reference fixed, the
+              objective decreases monotonically (with sharply diminishing
+              returns) as dof grows, so the learned value drifts upward with
+              more iterations rather than settling. ``"inherit"`` is preferred
+              unless you specifically want the new points to relearn dof.
+            - a float: use that fixed dof for the partial embedding.
+
+        initial_dof: Optional[float]
+            Starting value for the learnable dof when ``dof="auto"``. Ignored
+            otherwise.
+
         **affinity_params: dict
             Additional params to be passed to the ``Affinities.to_new`` method.
             Please see individual :class:`~openTSNE.affinity.Affinities`
@@ -875,17 +1251,16 @@ class TSNEEmbedding(np.ndarray):
             optimization.
 
         """
-
         # To maintain perfect backwards compatibility and to handle the very
         # specific case when the user wants to pass in `perplexity` to the
         # multiscale affinity object (multiscale accepts `perplexities`), rename
         # this parameter so everything works
         affinity_signature = inspect.signature(self.affinities.to_new)
         if (
-            "perplexities" in affinity_signature.parameters and
-            "perplexities" in affinity_signature.parameters and
-            "perplexity" in affinity_params and
-            "perplexities" not in affinity_params
+            "perplexities" in affinity_signature.parameters
+            and "perplexities" in affinity_signature.parameters
+            and "perplexity" in affinity_params
+            and "perplexities" not in affinity_params
         ):
             affinity_params["perplexities"] = affinity_params.pop("perplexity")
 
@@ -913,9 +1288,81 @@ class TSNEEmbedding(np.ndarray):
         else:
             raise ValueError(f"Unrecognized initialization scheme `{initialization}`.")
 
-        return PartialTSNEEmbedding(
-            embedding, self, P=P, **self.gradient_descent_params,
+        gd_params = dict(self.gradient_descent_params)
+        gd_params, warm_start_dof = self._resolve_partial_dof(
+            gd_params, dof, initial_dof
         )
+
+        partial = PartialTSNEEmbedding(
+            embedding,
+            self,
+            P=P,
+            **gd_params,
+        )
+        # For `dof="auto"` with no explicit `initial_dof`, warm-start the
+        # partial's `dof_` so the optimizer continues from the parent's
+        # learned value rather than restarting from 1.0.
+        if warm_start_dof is not None:
+            partial.dof_ = warm_start_dof
+        return partial
+
+    def _resolve_partial_dof(self, gd_params, dof, initial_dof):
+        """Resolve the partial-embedding dof mode.
+
+        Returns a (gd_params, warm_start_dof) pair: ``gd_params`` is the
+        merged param dict to hand to ``PartialTSNEEmbedding``, and
+        ``warm_start_dof`` is an optional float to assign to ``partial.dof_``
+        after construction (used only by the ``dof="auto"`` warm-start path).
+        """
+        warm_start_dof = None
+
+        if dof == "inherit":
+            inherited = self.dof_
+            if inherited is None:
+                # `parent.dof_ is None` only when the parent was constructed
+                # with `dof="auto"` and never optimized — for fixed-dof
+                # parents the constructor mirrors the value into `dof_`. With
+                # nothing learned to inherit, fall back to the parent's
+                # `initial_dof`, then to 1.0 (the optimizer's bootstrap).
+                parent_initial = self.gradient_descent_params.get("initial_dof")
+                inherited = parent_initial if parent_initial is not None else 1.0
+            gd_params["dof"] = float(inherited)
+            gd_params.pop("initial_dof", None)
+            if initial_dof is not None:
+                warnings.warn(
+                    "`initial_dof` is ignored when `dof='inherit'`.",
+                    stacklevel=3,
+                )
+        elif dof == "auto":
+            warnings.warn(
+                "Learning dof for new points (`dof='auto'` on transform / "
+                "prepare_partial) is uncharted territory: against a fixed "
+                "reference embedding the objective has no interior optimum in "
+                "dof, so the learned value drifts upward with more iterations "
+                "rather than settling. Use at your own risk; `dof='inherit'` "
+                "(the default) is recommended.",
+                stacklevel=3,
+            )
+            gd_params["dof"] = "auto"
+            gd_params["initial_dof"] = initial_dof
+            # If the user did not pin `initial_dof` and the parent has a
+            # learned dof, warm-start from it. Explicit `initial_dof` wins.
+            if initial_dof is None and self.dof_ is not None:
+                warm_start_dof = float(self.dof_)
+        elif isinstance(dof, (int, float)) and not isinstance(dof, bool):
+            gd_params["dof"] = float(dof)
+            gd_params.pop("initial_dof", None)
+            if initial_dof is not None:
+                warnings.warn(
+                    "`initial_dof` is ignored when `dof` is a fixed float.",
+                    stacklevel=3,
+                )
+        else:
+            raise ValueError(
+                f"`dof` must be 'inherit', 'auto', or a float; got {dof!r}."
+            )
+
+        return gd_params, warm_start_dof
 
     def prepare_interpolation_grid(self, padding=0.25):
         """Evaluate and save the interpolation grid coefficients.
@@ -939,53 +1386,135 @@ class TSNEEmbedding(np.ndarray):
         else:
             raise RuntimeError("Cannot prepare interpolation grid for >2d embeddings")
 
+        # The grid encodes the reference kernel, so it must be built with the
+        # dof actually in effect: for `dof="auto"` that is the learned `dof_`,
+        # falling back through the same cascade as `_resolve_partial_dof` when
+        # the embedding was never optimized.
+        dof = self.gradient_descent_params["dof"]
+        if not isinstance(dof, (int, float)):
+            dof = self.dof_
+            if dof is None:
+                dof = self.gradient_descent_params.get("initial_dof") or 1.0
+
         result = f(
             self.ravel() if self.shape[1] == 1 else self,
             self.gradient_descent_params["n_interpolation_points"],
             self.gradient_descent_params["min_num_intervals"],
             self.gradient_descent_params["ints_in_interval"],
-            self.gradient_descent_params["dof"],
+            dof,
             padding=padding,
         )
 
         if len(result) == 2:  # 1d case
             self.interp_coeffs, self.box_x_lower_bounds = result
         elif len(result) == 3:  # 2d case
-            self.interp_coeffs, self.box_x_lower_bounds, self.box_y_lower_bounds = result
+            self.interp_coeffs, self.box_x_lower_bounds, self.box_y_lower_bounds = (
+                result
+            )
         else:
             raise RuntimeError(
                 "Prepare interpolation grid function returned >3 values!"
             )
 
+    # Sentinel marking the start of openTSNE-specific pickle state. The
+    # numpy ndarray pickle state is a tuple of opaque values, so we append a
+    # single tagged dict as the last element. This lets us evolve the schema
+    # by bumping `_PICKLE_VERSION` without relying on the tuple length.
+    _PICKLE_SENTINEL = "__openTSNE_TSNEEmbedding__"
+    _PICKLE_VERSION = 2
+
     def __reduce__(self):
         state = super().__reduce__()
-        new_state = state[2] + (
-            self.optimizer,
-            self.affinities,
-            self.gradient_descent_params,
-            self.random_state,
-            self.kl_divergence,
-            self.interp_coeffs,
-            self.box_x_lower_bounds,
-            self.box_y_lower_bounds,
-        )
+        payload = {
+            "_sentinel": self._PICKLE_SENTINEL,
+            "_version": self._PICKLE_VERSION,
+            "optimizer": self.optimizer,
+            "affinities": self.affinities,
+            "gradient_descent_params": self.gradient_descent_params,
+            "random_state": self.random_state,
+            "kl_divergence_": self.kl_divergence_,
+            "interp_coeffs": self.interp_coeffs,
+            "box_x_lower_bounds": self.box_x_lower_bounds,
+            "box_y_lower_bounds": self.box_y_lower_bounds,
+            "dof_": self.dof_,
+            "optimization_iters_": self.optimization_iters_,
+        }
+        new_state = state[2] + (payload,)
         return state[0], state[1], new_state
 
     def __setstate__(self, state):
+        if (
+            isinstance(state[-1], dict)
+            and state[-1].get("_sentinel") == self._PICKLE_SENTINEL
+        ):
+            payload = state[-1]
+            version = payload.get("_version")
+            if version == 2:
+                self._restore_v2(payload)
+                super().__setstate__(state[:-1])
+                return
+            raise ValueError(
+                f"Unsupported TSNEEmbedding pickle version: {version!r}. "
+                "This pickle was produced by a newer openTSNE."
+            )
+
+        # Legacy (pre-versioning) tuple layouts. Kept for backwards
+        # compatibility with pickles produced before the sentinel was added.
+        self._restore_legacy(state)
+
+    def _restore_v2(self, payload):
+        self.optimizer = payload["optimizer"]
+        self.affinities = payload["affinities"]
+        self.gradient_descent_params = payload["gradient_descent_params"]
+        self.random_state = payload["random_state"]
+        self.kl_divergence_ = payload["kl_divergence_"]
+        self.interp_coeffs = payload["interp_coeffs"]
+        self.box_x_lower_bounds = payload["box_x_lower_bounds"]
+        self.box_y_lower_bounds = payload["box_y_lower_bounds"]
+        self.dof_ = payload["dof_"]
+        self.optimization_iters_ = payload["optimization_iters_"]
+
+    def _restore_legacy(self, state):
+        # Pre-sentinel layouts (oldest → newest):
+        #   12 elems: no optimizer (early bug — `gradient_descent` was missing
+        #             from the pickle).
+        #   13 elems: with optimizer (added later).
+        # Neither layout stored `dof_` or `optimization_iters_`. Only fixed dof
+        # existed then, so `dof_` is recovered from the stored parameters.
+        self.optimization_iters_ = 0
+
         self.box_y_lower_bounds = state[-1]
         self.box_x_lower_bounds = state[-2]
         self.interp_coeffs = state[-3]
-        self.kl_divergence = state[-4]
+        self.kl_divergence_ = state[-4]
         self.random_state = state[-5]
         self.gradient_descent_params = state[-6]
         self.affinities = state[-7]
 
-        if len(state) == 12:  # backwards compat (when I forgot optimizer)
+        dof = self.gradient_descent_params.get("dof")
+        self.dof_ = dof if isinstance(dof, (int, float)) else None
+
+        if len(state) == 12:
             self.optimizer = gradient_descent()
             super().__setstate__(state[:-7])
-        else:
+        elif len(state) == 13:
             self.optimizer = state[-8]
             super().__setstate__(state[:-8])
+        else:
+            raise ValueError(
+                f"Unrecognized legacy TSNEEmbedding pickle layout "
+                f"(length={len(state)})."
+            )
+
+    @property
+    def kl_divergence(self):
+        warnings.warn(
+            "The `kl_divergence` attribute is deprecated and will be removed "
+            "in a future release. Use `kl_divergence_` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.kl_divergence_
 
 
 class TSNE(BaseEstimator):
@@ -1010,7 +1539,7 @@ class TSNE(BaseEstimator):
         the appropriate learning rate is selected according to N / exaggeration
         as determined in Belkina et al. (2019), Nature Communications. Note that
         this will result in a different learning rate during the early
-        exaggeration phase and afterwards. This should *not* be used when 
+        exaggeration phase and afterwards. This should *not* be used when
         adding samples into existing embeddings, where the learning rate often
         needs to be much lower to obtain convergence.
 
@@ -1032,9 +1561,21 @@ class TSNE(BaseEstimator):
         This can be used to form more densely packed clusters and is useful
         for large data sets.
 
-    dof: float
+    dof: Union[float, str]
         Degrees of freedom as described in Kobak et al. "Heavy-tailed kernels
-        reveal a finer cluster structure in t-SNE visualisations", 2019.
+        reveal a finer cluster structure in t-SNE visualisations", 2019. If
+        ``dof="auto"``, the degrees of freedom are learned during optimization
+        jointly with the embedding. Supported by both the Barnes-Hut and FFT
+        negative gradient methods; when embedding new points into an existing
+        embedding (``transform``), only Barnes-Hut computes the dof gradient
+        and the FFT path will warn and keep dof fixed. The latest learned
+        value is written back to ``embedding.dof_`` and persists across
+        consecutive ``optimize()`` calls.
+
+    initial_dof: Optional[float]
+        Starting value for the learnable degrees of freedom when
+        ``dof="auto"``. If unset, learning starts at 1.0. Ignored when
+        ``dof`` is a fixed float (a warning is emitted in that case).
 
     theta: float
         Only used when ``negative_gradient_method="bh"`` or its other aliases.
@@ -1148,6 +1689,7 @@ class TSNE(BaseEstimator):
         n_iter=500,
         exaggeration=None,
         dof=1,
+        initial_dof=None,
         theta=0.5,
         n_interpolation_points=3,
         min_num_intervals=50,
@@ -1182,6 +1724,7 @@ class TSNE(BaseEstimator):
         self.n_iter = n_iter
         self.exaggeration = exaggeration
         self.dof = dof
+        self.initial_dof = initial_dof
         self.theta = theta
         self.n_interpolation_points = n_interpolation_points
         self.min_num_intervals = min_num_intervals
@@ -1323,7 +1866,6 @@ class TSNE(BaseEstimator):
             optimization.
 
         """
-
         # Either `X` or `affinities` must be specified
         if X is None and affinities is None and initialization is None:
             raise ValueError(
@@ -1373,7 +1915,11 @@ class TSNE(BaseEstimator):
             initialization = "spectral"
 
         # Same spiel for precomputed distance matrices
-        if self.metric == "precomputed" and isinstance(initialization, str) and initialization == "pca":
+        if (
+            self.metric == "precomputed"
+            and isinstance(initialization, str)
+            and initialization == "pca"
+        ):
             log.warning(
                 "Attempting to use `pca` initalization, but using precomputed "
                 "distance matrix! Using `spectral` initilization instead, which "
@@ -1423,9 +1969,7 @@ class TSNE(BaseEstimator):
                 verbose=self.verbose,
             )
         else:
-            raise ValueError(
-                f"Unrecognized initialization scheme `{initialization}`."
-            )
+            raise ValueError(f"Unrecognized initialization scheme `{initialization}`.")
 
         gradient_descent_params = {
             "dof": self.dof,
@@ -1446,6 +1990,7 @@ class TSNE(BaseEstimator):
             # Callback params
             "callbacks": self.callbacks,
             "callbacks_every_iters": self.callbacks_every_iters,
+            "initial_dof": self.initial_dof,
         }
 
         return TSNEEmbedding(
@@ -1464,6 +2009,7 @@ def kl_divergence_bh(
     reference_embedding=None,
     should_eval_error=False,
     n_jobs=1,
+    compute_dof_grad=False,
     **_,
 ):
     if embedding.ndim != 1 and embedding.shape[1] > 3:
@@ -1491,7 +2037,7 @@ def kl_divergence_bh(
 
     # Compute negative gradient
     tree = QuadTree(reference_embedding)
-    sum_Q = _tsne.estimate_negative_gradient_bh(
+    sum_Q, alpha_grad_neg = _tsne.estimate_negative_gradient_bh(
         tree,
         embedding,
         gradient,
@@ -1499,20 +2045,22 @@ def kl_divergence_bh(
         dof=dof,
         num_threads=n_jobs,
         pairwise_normalization=pairwise_normalization,
+        compute_dof_grad=compute_dof_grad,
     )
     del tree
 
     # Compute positive gradient
-    sum_P, kl_divergence_ = _tsne.estimate_positive_gradient_nn(
+    sum_P, kl_divergence_, alpha_grad_pos = _tsne.estimate_positive_gradient_nn(
         P.indices,
         P.indptr,
         P.data,
         embedding,
         reference_embedding,
         gradient,
-        dof,
+        dof=dof,
         num_threads=n_jobs,
         should_eval_error=should_eval_error,
+        compute_dof_grad=compute_dof_grad,
     )
 
     # Computing positive gradients summed up only unnormalized q_ijs, so we
@@ -1520,7 +2068,12 @@ def kl_divergence_bh(
     if should_eval_error:
         kl_divergence_ += sum_P * np.log(sum_Q + EPSILON)
 
-    return kl_divergence_, gradient
+    dof_grad = alpha_grad_pos - alpha_grad_neg if compute_dof_grad else 0.0
+    return GradientResult(
+        error=kl_divergence_,
+        gradient=gradient,
+        dof_grad=dof_grad,
+    )
 
 
 def kl_divergence_fft(
@@ -1531,9 +2084,17 @@ def kl_divergence_fft(
     reference_embedding=None,
     should_eval_error=False,
     n_jobs=1,
+    compute_dof_grad=False,
     **_,
 ):
     gradient = np.zeros_like(embedding, dtype=np.float64, order="C")
+
+    # The dof gradient is only implemented for self-embeddings: the grid-based
+    # (transform) path does not compute its negative term; see the guard in
+    # `gradient_descent.__call__`.
+    if reference_embedding is not None:
+        compute_dof_grad = False
+    alpha_grad_neg = 0.0
 
     # Compute negative gradient.
     if embedding.ndim == 1 or embedding.shape[1] == 1:
@@ -1547,9 +2108,13 @@ def kl_divergence_fft(
                 dof=dof,
             )
         else:
-            sum_Q = _tsne.estimate_negative_gradient_fft_1d(
-                embedding.ravel(), gradient.ravel(), **fft_params, dof=dof,
+            sum_Q, alpha_grad_neg = _tsne.estimate_negative_gradient_fft_1d(
+                embedding.ravel(),
+                gradient.ravel(),
+                **fft_params,
+                dof=dof,
                 num_threads=n_jobs,
+                compute_dof_grad=compute_dof_grad,
             )
     elif embedding.shape[1] == 2:
         if reference_embedding is not None:
@@ -1563,8 +2128,13 @@ def kl_divergence_fft(
                 dof=dof,
             )
         else:
-            sum_Q = _tsne.estimate_negative_gradient_fft_2d(
-                embedding, gradient, **fft_params, dof=dof, num_threads=n_jobs,
+            sum_Q, alpha_grad_neg = _tsne.estimate_negative_gradient_fft_2d(
+                embedding,
+                gradient,
+                **fft_params,
+                dof=dof,
+                num_threads=n_jobs,
+                compute_dof_grad=compute_dof_grad,
             )
     else:
         raise RuntimeError(
@@ -1577,7 +2147,7 @@ def kl_divergence_fft(
         reference_embedding = embedding
 
     # Compute positive gradient
-    sum_P, kl_divergence_ = _tsne.estimate_positive_gradient_nn(
+    sum_P, kl_divergence_, alpha_grad_pos = _tsne.estimate_positive_gradient_nn(
         P.indices,
         P.indptr,
         P.data,
@@ -1587,26 +2157,45 @@ def kl_divergence_fft(
         dof,
         num_threads=n_jobs,
         should_eval_error=should_eval_error,
+        compute_dof_grad=compute_dof_grad,
     )
 
     if should_eval_error:
         kl_divergence_ += sum_P * np.log(sum_Q + EPSILON)
 
-    return kl_divergence_, gradient
+    dof_grad = alpha_grad_pos - alpha_grad_neg if compute_dof_grad else 0.0
+    return GradientResult(
+        error=kl_divergence_,
+        gradient=gradient,
+        dof_grad=dof_grad,
+    )
 
 
 class gradient_descent:
     def __init__(self):
-        self.gains = None
-        self.update = None
+        # One optimizer per learnable parameter. Additional entries (e.g.
+        # "dof") are added lazily in `__call__` as needed.
+        self.optimizers = {"embedding": DeltaBarDeltaOptimizer()}
 
     def copy(self):
         optimizer = self.__class__()
-        if self.gains is not None:
-            optimizer.gains = np.copy(self.gains)
-        if self.update is not None:
-            optimizer.update = np.copy(self.update)
+        optimizer.optimizers = {
+            name: opt.copy() for name, opt in self.optimizers.items()
+        }
         return optimizer
+
+    def __setstate__(self, state):
+        # Backwards compat for pickles produced before the optimizer was
+        # extracted into DeltaBarDeltaOptimizer. Old pickles stored the
+        # embedding state flat on `gradient_descent` as `gains`/`update`.
+        if "optimizers" in state:
+            self.__dict__.update(state)
+            return
+
+        emb = DeltaBarDeltaOptimizer()
+        emb.gains = state.get("gains")
+        emb.update = state.get("update")
+        self.optimizers = {"embedding": emb}
 
     def __call__(
         self,
@@ -1618,6 +2207,8 @@ class gradient_descent:
         momentum=0.8,
         exaggeration=None,
         dof=1,
+        initial_dof=None,
+        dof_lr=0.1,
         min_gain=0.01,
         max_grad_norm=None,
         max_step_norm=5,
@@ -1630,6 +2221,7 @@ class gradient_descent:
         use_callbacks=False,
         callbacks=None,
         callbacks_every_iters=50,
+        eval_error_every_iter=50,
         verbose=False,
     ):
         """Perform batch gradient descent with momentum and gains.
@@ -1667,8 +2259,27 @@ class gradient_descent:
             The exaggeration factor is used to increase the attractive forces of
             nearby points, producing more compact clusters.
 
-        dof: float
-            Degrees of freedom of the Student's t-distribution.
+        dof: Union[float, str]
+            Degrees of freedom of the Student's t-distribution. If
+            ``dof="auto"``, the degrees of freedom are learned during
+            optimization (supported by both the Barnes-Hut and FFT objectives
+            for self-embeddings; only Barnes-Hut when embedding into a
+            reference embedding); the optimizer warm-starts from
+            ``embedding.dof_`` if set, otherwise from ``initial_dof``,
+            otherwise from 1.0.
+
+        initial_dof: Optional[float]
+            Starting value for the learnable degrees of freedom when
+            ``dof="auto"``. Ignored otherwise (and a warning is emitted if
+            given alongside a fixed ``dof``).
+
+        dof_lr: float
+            Base learning rate for the learnable degrees of freedom when
+            ``dof="auto"``. dof is learned in log space, and the update is
+            applied with an effective rate of ``dof_lr / exaggeration`` -- the
+            same ``1/exaggeration`` factor the embedding's ``N / exaggeration``
+            rate uses, which cancels the exaggeration-induced inflation of the
+            dof gradient.
 
         min_gain: float
             Minimum individual gain for each parameter.
@@ -1721,13 +2332,22 @@ class gradient_descent:
 
         use_callbacks: bool
 
-        callbacks: Callable[[int, float, np.ndarray] -> bool]
+        callbacks: Callable[[IterationState], bool]
             Callbacks, which will be run every ``callbacks_every_iters``
-            iterations.
+            iterations. Each callback receives an :class:`IterationState`
+            snapshot — see that class for the available fields and the
+            distinction between the per-call ``state.iteration`` counter and
+            the cumulative ``state.embedding.optimization_iters_`` counter.
+            Returning ``True`` from any callback will interrupt the
+            optimization. The legacy three-argument signature
+            ``callback(iteration, error, embedding)`` is still accepted but
+            emits a ``FutureWarning`` and will be removed in a future release.
 
         callbacks_every_iters: int
             How many iterations should pass between each time the callbacks are
             invoked.
+        eval_error_every_iter: int
+            How often should the error be evaluated, by default 50
 
         Returns
         -------
@@ -1755,9 +2375,9 @@ class gradient_descent:
 
         # If the interpolation grid has not yet been evaluated, do it now
         if (
-            reference_embedding is not None and
-            reference_embedding.interp_coeffs is None and
-            objective_function is kl_divergence_fft
+            reference_embedding is not None
+            and reference_embedding.interp_coeffs is None
+            and objective_function is kl_divergence_fft
         ):
             reference_embedding.prepare_interpolation_grid()
 
@@ -1769,11 +2389,6 @@ class gradient_descent:
                 should_limit_range = True
                 lower_limit = reference_embedding.box_x_lower_bounds[0]
                 upper_limit = reference_embedding.box_x_lower_bounds[-1]
-
-        if self.update is None:
-            self.update = np.zeros_like(embedding).view(np.ndarray)
-        if self.gains is None:
-            self.gains = np.ones_like(embedding).view(np.ndarray)
 
         bh_params = {"theta": theta}
         fft_params = {
@@ -1796,9 +2411,8 @@ class gradient_descent:
                 getattr(callback, "optimization_about_to_start", lambda: ...)()
 
         timer = utils.Timer(
-            "Running optimization with exaggeration=%.2f, lr=%.2f for %d iterations..." % (
-                exaggeration, learning_rate, n_iter
-            ),
+            "Running optimization with exaggeration=%.2f, lr=%.2f for %d iterations..."
+            % (exaggeration, learning_rate, n_iter),
             verbose=verbose,
         )
         timer.__enter__()
@@ -1806,66 +2420,145 @@ class gradient_descent:
         if verbose:
             start_time = time()
 
-        for iteration in range(n_iter):
-            should_call_callback = use_callbacks and (iteration + 1) % callbacks_every_iters == 0
-            # Evaluate error on 50 iterations for logging, or when callbacks
-            should_eval_error = should_call_callback or \
-                (verbose and (iteration + 1) % 50 == 0)
+        if dof == "auto":
+            if initial_dof is not None:
+                try:
+                    valid = bool(np.isfinite(initial_dof) and initial_dof > 0)
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    raise ValueError(
+                        "`initial_dof` must be a positive, finite number; got "
+                        f"{initial_dof!r}."
+                    )
+            if "dof" not in self.optimizers:
+                # Cap the gain at 1 to prevent runaway, unrecoverable dof during
+                # exaggerated phases of the optimization
+                self.optimizers["dof"] = DeltaBarDeltaOptimizer(max_gain=1)
+            if embedding.dof_ is not None:
+                dof_ = embedding.dof_
+            elif initial_dof is not None:
+                dof_ = initial_dof
+            else:
+                dof_ = 1.0
+            compute_dof_grad = True
+        else:
+            if initial_dof is not None:
+                warnings.warn(
+                    "`initial_dof=%s` is ignored because `dof=%s` is fixed; "
+                    "`initial_dof` only applies when `dof='auto'`."
+                    % (initial_dof, dof),
+                    stacklevel=2,
+                )
+            dof_ = dof
+            compute_dof_grad = False
 
-            error, gradient = objective_function(
+        initial_iter = getattr(embedding, "optimization_iters_", 0) or 0
+
+        if (
+            dof == "auto"
+            and objective_function is kl_divergence_fft
+            and reference_embedding is not None
+        ):
+            log.warning(
+                "Learning the degrees of freedom (`dof='auto'`) with the FFT "
+                "objective is only implemented for self-embeddings. When "
+                "embedding new points into an existing embedding, the dof "
+                "gradient is not computed, so dof will remain fixed at %s. Set "
+                "`negative_gradient_method='bh'` to learn dof during "
+                "transform.",
+                dof_,
+            )
+
+        for iteration in range(n_iter):
+            should_call_callback = (
+                use_callbacks and (iteration + 1) % callbacks_every_iters == 0
+            )
+
+            should_eval_error = should_call_callback or (
+                verbose and (iteration + 1) % eval_error_every_iter == 0
+            )
+
+            result = objective_function(
                 embedding,
                 P,
-                dof=dof,
+                dof=dof_,
                 bh_params=bh_params,
                 fft_params=fft_params,
                 reference_embedding=reference_embedding,
                 n_jobs=n_jobs,
                 should_eval_error=should_eval_error,
+                compute_dof_grad=compute_dof_grad,
             )
+            error = result.error
+            gradient = result.gradient
+            dof_grad = result.dof_grad
+
+            # Snapshot the raw gradient before any in-place modification so the
+            # callback sees what the objective actually returned.
+            gradient_snapshot = np.array(gradient) if should_call_callback else None
 
             # Clip gradients to avoid points shooting off. This can be an issue
             # when applying transform and points are initialized so that the new
             # points overlap with the reference points, leading to large
             # gradients
             if max_grad_norm is not None:
-                norm = np.linalg.norm(gradient, axis=1)
-                coeff = max_grad_norm / (norm + 1e-6)
-                mask = coeff < 1
-                gradient[mask] *= coeff[mask, None]
+                clip_gradient_norm(gradient, max_grad_norm, inplace=True)
 
             # Correct the KL divergence w.r.t. the exaggeration if needed
             if should_eval_error and exaggeration != 1:
                 error = error / exaggeration - np.log(exaggeration)
 
             if should_call_callback:
-                # Continue only if all the callbacks say so
-                should_stop = any(
-                    (bool(c(iteration + 1, error, embedding)) for c in callbacks)
+                state = IterationState(
+                    iteration=iteration + 1,
+                    exaggeration=exaggeration,
+                    embedding=_snapshot_embedding(
+                        embedding, dof_, initial_iter + iteration + 1
+                    ),
+                    gradient=gradient_snapshot,
+                    error=error,
+                    dof=dof_,
+                    dof_grad=dof_grad,
                 )
+                # Continue only if all the callbacks say so
+                should_stop = any(bool(c(state)) for c in callbacks)
                 if should_stop:
                     # Make sure to un-exaggerate P so it's not corrupted in future runs
                     if exaggeration != 1:
                         P /= exaggeration
+                    embedding.dof_ = dof_
+                    # Callbacks run before this iteration's update, which is
+                    # skipped, so it is not counted
+                    embedding.optimization_iters_ = initial_iter + iteration
                     raise OptimizationInterrupt(error=error, final_embedding=embedding)
 
-            # Update the embedding using the gradient
-            grad_direction_flipped = np.sign(self.update) != np.sign(gradient)
-            grad_direction_same = np.invert(grad_direction_flipped)
-            self.gains[grad_direction_flipped] += 0.2
-            self.gains[grad_direction_same] = (
-                self.gains[grad_direction_same] * 0.8 + min_gain
+            if dof == "auto":
+                # Take one gradient-descent step on log_dof = log(dof), then map
+                # back. Log space keeps dof > 0 with no clamps and makes the update
+                # multiplicative/scale-free. The rate carries the same
+                # 1/exaggeration factor as the embedding's N/exaggeration, which
+                # cancels the exaggeration-induced inflation of the gradient's
+                # attractive term.
+                dof_learning_rate = dof_lr / exaggeration
+                log_dof = np.log(dof_)
+                # Chain rule: dC/d(log_dof) = dC/d(dof) * dof = dof_grad * dof.
+                log_dof_grad = np.atleast_1d(dof_grad * dof_)
+                log_dof_step = self.optimizers["dof"].step(
+                    log_dof_grad, dof_learning_rate, momentum, min_gain=min_gain,
+                )[0]
+                log_dof += float(log_dof_step)
+                dof_ = float(np.exp(log_dof))
+
+            step = self.optimizers["embedding"].step(
+                gradient.view(np.ndarray),
+                learning_rate,
+                momentum,
+                min_gain=min_gain,
             )
-            gradient = gradient.view(np.ndarray)
-            self.update = momentum * self.update - learning_rate * self.gains * gradient
-
-            # Clip the update sizes
             if max_step_norm is not None:
-                update_norms = np.linalg.norm(self.update, axis=1, keepdims=True)
-                mask = update_norms.squeeze() > max_step_norm
-                self.update[mask] /= update_norms[mask]
-                self.update[mask] *= max_step_norm
-
-            embedding += self.update
+                clip_step_norm(step, max_step_norm, inplace=True)
+            embedding += step
 
             # Zero-mean the embedding only if we're not adding new data points,
             # otherwise this will reset point positions
@@ -1879,18 +2572,25 @@ class gradient_descent:
                     np.clip(embedding, lower_limit, upper_limit, out=embedding)
                 elif embedding.shape[1] == 2:
                     r_limit = max(abs(lower_limit), abs(upper_limit))
-                    embedding, mask = utils.clip_point_to_disc(embedding, r_limit, inplace=True)
+                    embedding, mask = utils.clip_point_to_disc(
+                        embedding, r_limit, inplace=True
+                    )
 
                 # Zero out the momentum terms for the points that hit the boundary
-                self.gains[mask] = 0
+                self.optimizers["embedding"].reset_momentum(mask)
 
             if verbose and (iteration + 1) % 50 == 0:
                 stop_time = time()
-                print("Iteration %4d, KL divergence %6.4f, 50 iterations in %.4f sec" % (
-                    iteration + 1, error, stop_time - start_time))
+                print(
+                    "Iteration %4d, KL divergence %6.4f, 50 iterations in %.4f sec"
+                    % (iteration + 1, error, stop_time - start_time)
+                )
                 start_time = time()
 
         timer.__exit__()
+
+        embedding.dof_ = dof_
+        embedding.optimization_iters_ = initial_iter + n_iter
 
         # Make sure to un-exaggerate P so it's not corrupted in future runs
         if exaggeration != 1:
@@ -1899,15 +2599,16 @@ class gradient_descent:
         # The error from the loop is the one for the previous, non-updated
         # embedding. We need to return the error for the actual final embedding, so
         # compute that at the end before returning
-        error, _ = objective_function(
+        result = objective_function(
             embedding,
             P,
-            dof=dof,
+            dof=dof_,
             bh_params=bh_params,
             fft_params=fft_params,
             reference_embedding=reference_embedding,
             n_jobs=n_jobs,
             should_eval_error=True,
+            compute_dof_grad=False,
         )
 
-        return error, embedding
+        return result.error, embedding

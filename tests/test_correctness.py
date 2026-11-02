@@ -7,7 +7,7 @@ import openTSNE
 import openTSNE.affinity
 import openTSNE.initialization
 import numpy as np
-from openTSNE.callbacks import VerifyExaggerationError
+from openTSNE.callbacks import ErrorApproximations, VerifyExaggerationError
 from sklearn import datasets
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
@@ -59,6 +59,36 @@ class TestTSNECorrectness(unittest.TestCase):
             callbacks=[VerifyExaggerationError(embedding)],
             callbacks_every_iters=1,
             inplace=True,
+        )
+
+    def test_error_exaggeration_correction_with_learned_dof(self):
+        for method in ("bh", "fft", "auto"):
+            with self.subTest(method=method):
+                tsne = openTSNE.TSNE(
+                    neighbors="exact", negative_gradient_method=method, dof="auto"
+                )
+                embedding = tsne.prepare_initial(self.x)
+                embedding.optimize(
+                    10,
+                    exaggeration=5,
+                    callbacks=[VerifyExaggerationError(embedding)],
+                    callbacks_every_iters=1,
+                    inplace=True,
+                )
+                self.assertNotEqual(embedding.dof_, 1)
+
+    def test_error_approximations_use_the_iteration_dof(self):
+        embedding = TSNE(dof=5, early_exaggeration_iter=0, n_iter=20).fit(self.x)
+        approximations = ErrorApproximations(embedding.affinities.P)
+        states = []
+        embedding.optimize(
+            3,
+            callbacks=[approximations, states.append],
+            callbacks_every_iters=1,
+            inplace=True,
+        )
+        np.testing.assert_allclose(
+            approximations.bh_errors, [s.error for s in states], rtol=1e-10
         )
 
     def test_iris(self):
@@ -408,29 +438,43 @@ class TestFFTGradientConcurrentThreads(unittest.TestCase):
 
         random_state = np.random.RandomState(0)
         # Different spans give different grid sizes, so the threads also
-        # disagree on the size of every buffer they ask for
+        # disagree on the size of every buffer they ask for. Computing the dof
+        # gradient adds a third kernel, and with it a third buffer
         cases = [
-            (random_state.normal(0, span, (2000, n_dims)), dof)
+            (random_state.normal(0, span, (2000, n_dims)), dof, compute_dof_grad)
             for span in spans
             for dof in (1, 0.7)
+            for compute_dof_grad in (False, True)
         ]
 
         def run(case):
-            embedding, dof = case
+            embedding, dof, compute_dof_grad = case
             gradient = np.zeros_like(embedding)
             if n_dims == 1:
-                sum_q = f(embedding.ravel(), gradient.ravel(), dof=dof)
+                sum_q, dof_grad = f(
+                    embedding.ravel(), gradient.ravel(), dof=dof,
+                    compute_dof_grad=compute_dof_grad,
+                )
             else:
-                sum_q = f(embedding, gradient, dof=dof)
-            return gradient, sum_q
+                sum_q, dof_grad = f(
+                    embedding, gradient, dof=dof, compute_dof_grad=compute_dof_grad
+                )
+            return gradient, sum_q, dof_grad
 
         expected = [run(case) for case in cases]
+        # A dof gradient that is always zero would make its comparison vacuous
+        for (_, _, compute_dof_grad), (_, _, dof_grad) in zip(cases, expected):
+            self.assertEqual(dof_grad != 0, compute_dof_grad)
+
         with ThreadPoolExecutor(max_workers=len(cases)) as executor:
             for _ in range(5):
                 results = list(executor.map(run, cases))
-                for (gradient, sum_q), (exp_gradient, exp_sum_q) in zip(results, expected):
+                for result, exp in zip(results, expected):
+                    gradient, sum_q, dof_grad = result
+                    exp_gradient, exp_sum_q, exp_dof_grad = exp
                     np.testing.assert_allclose(gradient, exp_gradient, rtol=1e-10)
                     np.testing.assert_allclose(sum_q, exp_sum_q, rtol=1e-10)
+                    np.testing.assert_allclose(dof_grad, exp_dof_grad, rtol=1e-10)
 
     def test_1d(self):
         from openTSNE import _tsne

@@ -8,3 +8,5 @@ dist/
 .ipynb_checkpoints/
 .DS_STORE
 *.cpp
+*.pyd
+*.obj

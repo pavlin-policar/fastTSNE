@@ -19,7 +19,8 @@ from openTSNE import initialization
 from openTSNE.affinity import PerplexityBasedNN
 from openTSNE.nearest_neighbors import NNDescent
 from openTSNE.tsne import (
-    kl_divergence_bh, kl_divergence_fft, TSNEEmbedding, PartialTSNEEmbedding
+    kl_divergence_bh, kl_divergence_fft, TSNEEmbedding, PartialTSNEEmbedding,
+    GradientResult,
 )
 from openTSNE.utils import is_package_installed
 
@@ -742,6 +743,19 @@ def get_mismatching_default_values(f1, f2, mapping=None):
     return mismatch
 
 
+class TestGradientResult(unittest.TestCase):
+    def test_required_fields(self):
+        g = np.zeros((4, 2))
+        r = GradientResult(error=1.5, gradient=g)
+        self.assertEqual(r.error, 1.5)
+        self.assertIs(r.gradient, g)
+        self.assertEqual(r.dof_grad, 0.0)
+
+    def test_dof_grad_can_be_set(self):
+        r = GradientResult(error=0.0, gradient=np.zeros((2, 2)), dof_grad=-0.7)
+        self.assertEqual(r.dof_grad, -0.7)
+
+
 class TestGradientDescentOptimizer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -754,18 +768,18 @@ class TestGradientDescentOptimizer(unittest.TestCase):
         embedding = self.tsne.prepare_initial(self.x)
 
         self.assertIsNone(
-            embedding.optimizer.gains, "Optimizer should be initialized with no gains"
+            embedding.optimizer.optimizers["embedding"].gains, "Optimizer should be initialized with no gains"
         )
 
         # Check the switch from no gains to some gains
         embedding1 = embedding.optimize(10)
         self.assertIsNone(
-            embedding.optimizer.gains,
+            embedding.optimizer.optimizers["embedding"].gains,
             "Gains changed on initial optimizer even though we did not do "
             "inplace optimization.",
         )
         self.assertIsNotNone(
-            embedding1.optimizer.gains, "Gains were not properly set in new embedding."
+            embedding1.optimizer.optimizers["embedding"].gains, "Gains were not properly set in new embedding."
         )
         self.assertIsNot(
             embedding.optimizer,
@@ -783,7 +797,7 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             "even we did not do inplace optimization.",
         )
         self.assertFalse(
-            np.allclose(embedding1.optimizer.gains, embedding2.optimizer.gains),
+            np.allclose(embedding1.optimizer.optimizers["embedding"].gains, embedding2.optimizer.optimizers["embedding"].gains),
             "The gains in the new embedding did not change at all from the old "
             "embedding.",
         )
@@ -800,19 +814,19 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             "Embedding and partial embedding optimizers are the same instance.",
         )
         self.assertIsNone(
-            partial.optimizer.gains,
+            partial.optimizer.optimizers["embedding"].gains,
             "Partial embedding was not initialized with no gains",
         )
 
         # Check the switch from no gains to some gains
         partial1 = partial.optimize(10)
         self.assertIsNone(
-            partial.optimizer.gains,
+            partial.optimizer.optimizers["embedding"].gains,
             "Gains on initial optimizer changed even though we did not do "
             "inplace optimization.",
         )
         self.assertIsNotNone(
-            partial1.optimizer.gains,
+            partial1.optimizer.optimizers["embedding"].gains,
             "Gains were not properly set in new partial embedding.",
         )
 
@@ -825,7 +839,7 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             "even we did not do inplace optimization.",
         )
         self.assertFalse(
-            np.allclose(partial1.optimizer.gains, partial2.optimizer.gains),
+            np.allclose(partial1.optimizer.optimizers["embedding"].gains, partial2.optimizer.optimizers["embedding"].gains),
             "The gains in the new embedding did not change at all from the old "
             "embedding.",
         )
@@ -854,30 +868,54 @@ class TestGradientDescentOptimizer(unittest.TestCase):
 
     def test_pickling(self):
         obj = openTSNE.tsne.gradient_descent()
-        obj.gains = np.ones(5)
+        obj.optimizers["embedding"].gains = np.ones(5)
         loaded_obj = pickle.loads(pickle.dumps(obj))
-        np.testing.assert_array_equal(loaded_obj.gains, np.ones(5))
+        np.testing.assert_array_equal(
+            loaded_obj.optimizers["embedding"].gains, np.ones(5)
+        )
+
+    def test_unpickling_legacy_optimizer_state(self):
+        # Pickles produced before the optimizer refactor stored `gains` and
+        # `update` directly on `gradient_descent` (and on the learnable-dof
+        # branch, also `dof_gain`/`dof_update`). Round-trip both shapes
+        # through pickle by setting the legacy attrs on the instance dict
+        # before dumping.
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        legacy_master = openTSNE.tsne.gradient_descent()
+        legacy_master.__dict__ = {"gains": np.ones(5), "update": np.zeros(5)}
+        loaded = pickle.loads(pickle.dumps(legacy_master))
+        self.assertIsInstance(
+            loaded.optimizers["embedding"], DeltaBarDeltaOptimizer
+        )
+        np.testing.assert_array_equal(
+            loaded.optimizers["embedding"].gains, np.ones(5)
+        )
+        np.testing.assert_array_equal(
+            loaded.optimizers["embedding"].update, np.zeros(5)
+        )
+        self.assertNotIn("dof", loaded.optimizers)
 
     def test_gains_is_always_numpy_array(self):
         embedding = self.tsne.prepare_initial(self.x)
-        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
-        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+        self.assertIsInstance(embedding.optimizer.optimizers["embedding"].gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.optimizers["embedding"].gains, openTSNE.TSNEEmbedding)
 
         embedding = embedding.optimize(10)
-        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
-        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+        self.assertIsInstance(embedding.optimizer.optimizers["embedding"].gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.optimizers["embedding"].gains, openTSNE.TSNEEmbedding)
 
         embedding.optimize(10, inplace=True)
-        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
-        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+        self.assertIsInstance(embedding.optimizer.optimizers["embedding"].gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.optimizers["embedding"].gains, openTSNE.TSNEEmbedding)
 
     def test_pickling_via_embedding(self):
         embedding = self.tsne.prepare_initial(self.x)
         # Before optimization
         loaded_embedding = pickle.loads(pickle.dumps(embedding))
         np.testing.assert_equal(
-            embedding.optimizer.gains,
-            loaded_embedding.optimizer.gains,
+            embedding.optimizer.optimizers["embedding"].gains,
+            loaded_embedding.optimizer.optimizers["embedding"].gains,
             "Failed loading without any optimization",
         )
 
@@ -886,8 +924,8 @@ class TestGradientDescentOptimizer(unittest.TestCase):
         # After optimization
         loaded_embedding = pickle.loads(pickle.dumps(embedding))
         np.testing.assert_equal(
-            embedding.optimizer.gains,
-            loaded_embedding.optimizer.gains,
+            embedding.optimizer.optimizers["embedding"].gains,
+            loaded_embedding.optimizer.optimizers["embedding"].gains,
             "Failed loading after optimization (differing gains)",
         )
 
@@ -899,7 +937,7 @@ class TestGradientDescentOptimizer(unittest.TestCase):
         partial = partial.optimize(10, negative_gradient_method="fft", learning_rate=0.1)
 
         self.assertTrue(
-            np.all(partial.optimizer.gains > 0),
+            np.all(partial.optimizer.optimizers["embedding"].gains > 0),
             "Gains of points inside the interpolation grid were zeroed out.",
         )
 
@@ -918,7 +956,7 @@ class TestGradientDescentOptimizer(unittest.TestCase):
             )
             partial = partial.optimize(5, learning_rate=0.1)
 
-            gains = partial.optimizer.gains
+            gains = partial.optimizer.optimizers["embedding"].gains
             np.testing.assert_array_equal(
                 gains[0], 0, "%dd: point at the boundary kept its gains" % n_components
             )
@@ -926,6 +964,54 @@ class TestGradientDescentOptimizer(unittest.TestCase):
                 np.all(gains[1:] > 0),
                 "%dd: points inside the grid had their gains zeroed" % n_components,
             )
+
+
+class TestDeltaBarDeltaOptimizer(unittest.TestCase):
+    def test_defaults_match_historical_constants(self):
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        opt = DeltaBarDeltaOptimizer()
+        self.assertEqual(opt.gain_increase, 0.2)
+        self.assertEqual(opt.gain_decay, 0.8)
+        self.assertEqual(opt.max_gain, np.inf)
+
+    def test_gain_runs_away_on_monotone_gradient_when_uncapped(self):
+        # A constant-sign gradient makes every step a consistent descent, so the
+        # uncapped gain grows ~ 1 + gain_increase * iters.
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        opt = DeltaBarDeltaOptimizer()
+        for _ in range(100):
+            opt.step(np.array([1.0]), learning_rate=0.01, momentum=0.0)
+        self.assertGreater(opt.gains[0], 15.0)
+
+    def test_max_gain_caps_runaway(self):
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        opt = DeltaBarDeltaOptimizer(max_gain=1.0)
+        for _ in range(100):
+            opt.step(np.array([1.0]), learning_rate=0.01, momentum=0.0)
+        self.assertLessEqual(opt.gains[0], 1.0)
+
+    def test_dof_optimizer_is_gain_capped(self):
+        # The dof optimizer must be created with a capped gain so the scalar dof
+        # cannot run away.
+        tsne = openTSNE.TSNE(
+            neighbors="exact", negative_gradient_method="bh",
+            dof="auto", random_state=42, n_iter=10, early_exaggeration_iter=10,
+        )
+        emb = tsne.fit(datasets.load_iris()["data"])
+        self.assertEqual(emb.optimizer.optimizers["dof"].max_gain, 1.0)
+
+    def test_setstate_supplies_missing_gain_params(self):
+        # Pickles from before the gain params were stored must still load.
+        from openTSNE.optimizer import DeltaBarDeltaOptimizer
+
+        opt = DeltaBarDeltaOptimizer()
+        opt.__setstate__({"gains": np.ones(3), "update": np.zeros(3)})
+        self.assertEqual(opt.gain_increase, 0.2)
+        self.assertEqual(opt.gain_decay, 0.8)
+        self.assertEqual(opt.max_gain, np.inf)
 
 
 class TestAffinityIntegration(unittest.TestCase):
@@ -995,6 +1081,38 @@ class TestTSNEEmebedding(unittest.TestCase):
             loaded_obj.transform(x_new), embedding.transform(x_new)
         )
 
+    def test_pickling_preserves_optimization_iters(self):
+        tsne = TSNE(early_exaggeration_iter=3, n_iter=7, random_state=4)
+        embedding = tsne.fit(np.random.randn(100, 4))
+        self.assertEqual(embedding.optimization_iters_, 10)
+
+        loaded = pickle.loads(pickle.dumps(embedding))
+        self.assertEqual(loaded.optimization_iters_, 10)
+
+    def test_unpickling_legacy_layout_keeps_fixed_dof(self):
+        # Pickles from before the versioned layout stored the array state
+        # followed by eight attributes, and no `dof_`.
+        tsne = TSNE(dof=5, n_iter=10, early_exaggeration_iter=0, random_state=4)
+        embedding = tsne.fit(np.random.randn(100, 4))
+        array_state = np.ndarray.__reduce__(embedding.view(np.ndarray))[2]
+        legacy_state = array_state + (
+            embedding.optimizer,
+            embedding.affinities,
+            embedding.gradient_descent_params,
+            embedding.random_state,
+            embedding.kl_divergence_,
+            embedding.interp_coeffs,
+            embedding.box_x_lower_bounds,
+            embedding.box_y_lower_bounds,
+        )
+        restored = np.ndarray.__new__(openTSNE.TSNEEmbedding, (0,))
+        restored.__setstate__(legacy_state)
+
+        np.testing.assert_array_equal(restored, embedding)
+        self.assertEqual(restored.dof_, 5)
+        partial = restored.prepare_partial(np.random.randn(5, 4))
+        self.assertEqual(partial.gradient_descent_params["dof"], 5)
+
 
 class TestPrecomputedDistanceMatrices(unittest.TestCase):
     def test_precomputed_dist_matrix_via_affinities_uses_spectral_init(self):
@@ -1008,7 +1126,9 @@ class TestPrecomputedDistanceMatrices(unittest.TestCase):
             n_iter=0, 
             random_state=42,
         ).fit(affinities=aff)
-        np.testing.assert_array_equal(embedding, desired_init)
+        # See note in `test_pca_init_with_only_affinities_passed`: the spectral
+        # init is recomputed inside `fit`, so compare with a tolerance.
+        np.testing.assert_allclose(embedding, desired_init, rtol=1e-5, atol=1e-10)
 
     def test_precomputed_dist_matrix_via_tsne_interface_uses_spectral_init(self):
         x = np.random.normal(0, 1, (200, 5))
@@ -1022,7 +1142,9 @@ class TestPrecomputedDistanceMatrices(unittest.TestCase):
             n_iter=0,
             random_state=42,
          ).fit(d)
-        np.testing.assert_array_equal(embedding, desired_init)
+        # See note in `test_pca_init_with_only_affinities_passed`: the spectral
+        # init is recomputed inside `fit`, so compare with a tolerance.
+        np.testing.assert_allclose(embedding, desired_init, rtol=1e-5, atol=1e-10)
 
     def test_precomputed_dist_matrix_doesnt_override_valid_inits(self):
         iris = datasets.load_iris()
