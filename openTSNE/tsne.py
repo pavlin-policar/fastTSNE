@@ -1398,8 +1398,8 @@ class TSNEEmbedding(np.ndarray):
         #   12 elems: no optimizer (early bug — `gradient_descent` was missing
         #             from the pickle).
         #   13 elems: with optimizer (added later).
-        # Neither layout knew about `dof_` or `optimization_iters_`.
-        self.dof_ = None
+        # Neither layout stored `dof_` or `optimization_iters_`. Only fixed dof
+        # existed then, so `dof_` is recovered from the stored parameters.
         self.optimization_iters_ = 0
 
         self.box_y_lower_bounds = state[-1]
@@ -1409,6 +1409,9 @@ class TSNEEmbedding(np.ndarray):
         self.random_state = state[-5]
         self.gradient_descent_params = state[-6]
         self.affinities = state[-7]
+
+        dof = self.gradient_descent_params.get("dof")
+        self.dof_ = dof if isinstance(dof, (int, float)) else None
 
         if len(state) == 12:
             self.optimizer = gradient_descent()

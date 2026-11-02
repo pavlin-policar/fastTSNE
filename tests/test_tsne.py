@@ -1089,6 +1089,30 @@ class TestTSNEEmebedding(unittest.TestCase):
         loaded = pickle.loads(pickle.dumps(embedding))
         self.assertEqual(loaded.optimization_iters_, 10)
 
+    def test_unpickling_legacy_layout_keeps_fixed_dof(self):
+        # Pickles from before the versioned layout stored the array state
+        # followed by eight attributes, and no `dof_`.
+        tsne = TSNE(dof=5, n_iter=10, early_exaggeration_iter=0, random_state=4)
+        embedding = tsne.fit(np.random.randn(100, 4))
+        array_state = np.ndarray.__reduce__(embedding.view(np.ndarray))[2]
+        legacy_state = array_state + (
+            embedding.optimizer,
+            embedding.affinities,
+            embedding.gradient_descent_params,
+            embedding.random_state,
+            embedding.kl_divergence_,
+            embedding.interp_coeffs,
+            embedding.box_x_lower_bounds,
+            embedding.box_y_lower_bounds,
+        )
+        restored = np.ndarray.__new__(openTSNE.TSNEEmbedding, (0,))
+        restored.__setstate__(legacy_state)
+
+        np.testing.assert_array_equal(restored, embedding)
+        self.assertEqual(restored.dof_, 5)
+        partial = restored.prepare_partial(np.random.randn(5, 4))
+        self.assertEqual(partial.gradient_descent_params["dof"], 5)
+
 
 class TestPrecomputedDistanceMatrices(unittest.TestCase):
     def test_precomputed_dist_matrix_via_affinities_uses_spectral_init(self):
