@@ -367,9 +367,13 @@ cpdef double estimate_negative_gradient_fft_1d(
     Py_ssize_t min_num_intervals=10,
     double ints_in_interval=1,
     double dof=1,
+    Py_ssize_t num_threads=1,
 ):
     cdef Py_ssize_t i, j, d, box_idx, n_samples = embedding.shape[0]
     cdef double y_max = -INFINITY, y_min = INFINITY
+    if num_threads < 1:
+        num_threads = 1
+
     # Determine the min/max values of the embedding
     for i in range(n_samples):
         if embedding[i] < y_min:
@@ -477,10 +481,10 @@ cpdef double estimate_negative_gradient_fft_1d(
     # STEP 2: Compute the kernel values evaluated at the interpolation nodes
     cdef double[:, ::1] y_tilde_values = np.empty((n_interpolation_points_1d, n_terms))
     if dof != 1:
-        matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients[:, :2], y_tilde_values[:, :2])
-        matrix_multiply_fft_1d(kernel_tilde, w_coefficients[:, 2:], y_tilde_values[:, 2:])
+        matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients[:, :2], y_tilde_values[:, :2], num_threads)
+        matrix_multiply_fft_1d(kernel_tilde, w_coefficients[:, 2:], y_tilde_values[:, 2:], num_threads)
     else:
-        matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients, y_tilde_values)
+        matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients, y_tilde_values, num_threads)
 
 
     # STEP 3: Compute the potentials \tilde{\phi(y_i)}
@@ -520,12 +524,16 @@ cpdef tuple prepare_negative_gradient_fft_interpolation_grid_1d(
     double ints_in_interval=1,
     double dof=1,
     double padding=0,
+    Py_ssize_t num_threads=1,
 ):
     cdef:
         Py_ssize_t i, j, d, box_idx
         Py_ssize_t n_reference_samples = reference_embedding.shape[0]
 
         double y_max = -INFINITY, y_min = INFINITY
+    if num_threads < 1:
+        num_threads = 1
+
     # Determine the min/max values of the embedding
     # First, check the existing embedding
     for i in range(n_reference_samples):
@@ -621,10 +629,10 @@ cpdef tuple prepare_negative_gradient_fft_interpolation_grid_1d(
     # STEP 2: Compute the kernel values evaluated at the interpolation nodes
     cdef double[:, ::1] y_tilde_values = np.empty((n_interpolation_points_1d, n_terms))
     if dof != 1:
-        matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients[:, :2], y_tilde_values[:, :2])
-        matrix_multiply_fft_1d(kernel_tilde, w_coefficients[:, 2:], y_tilde_values[:, 2:])
+        matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients[:, :2], y_tilde_values[:, :2], num_threads)
+        matrix_multiply_fft_1d(kernel_tilde, w_coefficients[:, 2:], y_tilde_values[:, 2:], num_threads)
     else:
-        matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients, y_tilde_values)
+        matrix_multiply_fft_1d(sq_kernel_tilde, w_coefficients, y_tilde_values, num_threads)
 
     PyMem_Free(reference_point_box_idx)
 
@@ -752,6 +760,7 @@ cpdef double estimate_negative_gradient_fft_2d(
     Py_ssize_t min_num_intervals=10,
     double ints_in_interval=1,
     double dof=1,
+    Py_ssize_t num_threads=1,
 ):
     cdef:
         Py_ssize_t i, j, d, box_idx
@@ -759,6 +768,9 @@ cpdef double estimate_negative_gradient_fft_2d(
         Py_ssize_t n_dims = embedding.shape[1]
 
         double coord_max = -INFINITY, coord_min = INFINITY
+    if num_threads < 1:
+        num_threads = 1
+
     # Determine the min/max values of the embedding
     for i in range(n_samples):
         if embedding[i, 0] < coord_min:
@@ -906,10 +918,10 @@ cpdef double estimate_negative_gradient_fft_2d(
     # STEP 2: Compute the kernel values evaluated at the interpolation nodes
     cdef double[:, ::1] y_tilde_values = np.empty((total_interpolation_points, n_terms))
     if dof != 1:
-        matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients[:, :3], y_tilde_values[:, :3])
-        matrix_multiply_fft_2d(kernel_tilde, w_coefficients[:, 3:], y_tilde_values[:, 3:])
+        matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients[:, :3], y_tilde_values[:, :3], num_threads)
+        matrix_multiply_fft_2d(kernel_tilde, w_coefficients[:, 3:], y_tilde_values[:, 3:], num_threads)
     else:
-        matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients, y_tilde_values)
+        matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients, y_tilde_values, num_threads)
 
     # STEP 3: Compute the potentials \tilde{\phi(y_i)}
     cdef double[:, ::1] phi = np.zeros((n_samples, n_terms), dtype=float)
@@ -961,12 +973,16 @@ cpdef tuple prepare_negative_gradient_fft_interpolation_grid_2d(
     double ints_in_interval=1,
     double dof=1,
     double padding=0,
+    Py_ssize_t num_threads=1,
 ):
     cdef:
         Py_ssize_t i, j, d, box_idx
         Py_ssize_t n_reference_samples = reference_embedding.shape[0]
 
         double coord_max = -INFINITY, coord_min = INFINITY
+    if num_threads < 1:
+        num_threads = 1
+
     # Determine the min/max values of the embedding
     # First, check the existing embedding
     for i in range(n_reference_samples):
@@ -1102,10 +1118,10 @@ cpdef tuple prepare_negative_gradient_fft_interpolation_grid_2d(
     # STEP 2: Compute the kernel values evaluated at the interpolation nodes
     cdef double[:, ::1] y_tilde_values = np.empty((total_interpolation_points, n_terms))
     if dof != 1:
-        matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients[:, :3], y_tilde_values[:, :3])
-        matrix_multiply_fft_2d(kernel_tilde, w_coefficients[:, 3:], y_tilde_values[:, 3:])
+        matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients[:, :3], y_tilde_values[:, :3], num_threads)
+        matrix_multiply_fft_2d(kernel_tilde, w_coefficients[:, 3:], y_tilde_values[:, 3:], num_threads)
     else:
-        matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients, y_tilde_values)
+        matrix_multiply_fft_2d(sq_kernel_tilde, w_coefficients, y_tilde_values, num_threads)
 
     return (
         np.asarray(y_tilde_values),

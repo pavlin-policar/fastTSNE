@@ -53,6 +53,7 @@ cpdef double estimate_negative_gradient_fft_1d(
     Py_ssize_t min_num_intervals=*,
     double ints_in_interval=*,
     double dof=*,
+    Py_ssize_t num_threads=*,
 )
 
 cpdef tuple prepare_negative_gradient_fft_interpolation_grid_1d(
@@ -62,6 +63,7 @@ cpdef tuple prepare_negative_gradient_fft_interpolation_grid_1d(
     double ints_in_interval=*,
     double dof=*,
     double padding=*,
+    Py_ssize_t num_threads=*,
 )
 
 cpdef double estimate_negative_gradient_fft_1d_with_grid(
@@ -80,6 +82,7 @@ cpdef double estimate_negative_gradient_fft_2d(
     Py_ssize_t min_num_intervals=*,
     double ints_in_interval=*,
     double dof=*,
+    Py_ssize_t num_threads=*,
 )
 
 cpdef tuple prepare_negative_gradient_fft_interpolation_grid_2d(
@@ -89,6 +92,7 @@ cpdef tuple prepare_negative_gradient_fft_interpolation_grid_2d(
     double ints_in_interval=*,
     double dof=*,
     double padding=*,
+    Py_ssize_t num_threads=*,
 )
 
 cpdef double estimate_negative_gradient_fft_2d_with_grid(

@@ -35,6 +35,7 @@ cdef void matrix_multiply_fft_1d(
     double[::1] kernel_tilde,
     double[:, ::1] w_coefficients,
     double[:, ::1] out,
+    Py_ssize_t num_threads=1,
 ):
     """Multiply the the kernel vectr K tilde with the w coefficients.
     
@@ -118,6 +119,7 @@ cdef void matrix_multiply_fft_2d(
     double[:, ::1] kernel_tilde,
     double[:, ::1] w_coefficients,
     double[:, ::1] out,
+    Py_ssize_t num_threads=1,
 ):
     """Multiply the the kernel matrix K tilde with the w coefficients.
     
