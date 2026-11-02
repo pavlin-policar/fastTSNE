@@ -400,7 +400,7 @@ setup(
     install_requires=[
         "numpy>=1.16.6",
         "scikit-learn>=0.20",
-        "scipy",
+        "scipy>=1.4",
     ],
     extras_require={
         "hnsw": "hnswlib>=0.5.0",

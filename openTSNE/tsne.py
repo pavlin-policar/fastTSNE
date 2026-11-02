@@ -1548,7 +1548,8 @@ def kl_divergence_fft(
             )
         else:
             sum_Q = _tsne.estimate_negative_gradient_fft_1d(
-                embedding.ravel(), gradient.ravel(), **fft_params, dof=dof
+                embedding.ravel(), gradient.ravel(), **fft_params, dof=dof,
+                num_threads=n_jobs,
             )
     elif embedding.shape[1] == 2:
         if reference_embedding is not None:
@@ -1563,7 +1564,7 @@ def kl_divergence_fft(
             )
         else:
             sum_Q = _tsne.estimate_negative_gradient_fft_2d(
-                embedding, gradient, **fft_params, dof=dof
+                embedding, gradient, **fft_params, dof=dof, num_threads=n_jobs,
             )
     else:
         raise RuntimeError(

@@ -397,3 +397,51 @@ class TestDataMatricesWithDuplicatedRows(unittest.TestCase):
         openTSNE.TSNE(
             early_exaggeration=100, negative_gradient_method="bh", random_state=0
         ).fit(self.x)
+
+
+class TestFFTGradientConcurrentThreads(unittest.TestCase):
+    """The FFT gradient reuses buffers between calls. Embeddings optimized at
+    the same time in different threads must still each get their own result."""
+
+    def check_concurrent_calls_match_serial(self, n_dims, f, spans):
+        from concurrent.futures import ThreadPoolExecutor
+
+        random_state = np.random.RandomState(0)
+        # Different spans give different grid sizes, so the threads also
+        # disagree on the size of every buffer they ask for
+        cases = [
+            (random_state.normal(0, span, (2000, n_dims)), dof)
+            for span in spans
+            for dof in (1, 0.7)
+        ]
+
+        def run(case):
+            embedding, dof = case
+            gradient = np.zeros_like(embedding)
+            if n_dims == 1:
+                sum_q = f(embedding.ravel(), gradient.ravel(), dof=dof)
+            else:
+                sum_q = f(embedding, gradient, dof=dof)
+            return gradient, sum_q
+
+        expected = [run(case) for case in cases]
+        with ThreadPoolExecutor(max_workers=len(cases)) as executor:
+            for _ in range(5):
+                results = list(executor.map(run, cases))
+                for (gradient, sum_q), (exp_gradient, exp_sum_q) in zip(results, expected):
+                    np.testing.assert_allclose(gradient, exp_gradient, rtol=1e-10)
+                    np.testing.assert_allclose(sum_q, exp_sum_q, rtol=1e-10)
+
+    def test_1d(self):
+        from openTSNE import _tsne
+
+        self.check_concurrent_calls_match_serial(
+            1, _tsne.estimate_negative_gradient_fft_1d, spans=(50, 500, 5000)
+        )
+
+    def test_2d(self):
+        from openTSNE import _tsne
+
+        self.check_concurrent_calls_match_serial(
+            2, _tsne.estimate_negative_gradient_fft_2d, spans=(5, 20, 60)
+        )
