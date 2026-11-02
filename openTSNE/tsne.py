@@ -118,7 +118,11 @@ def _adapt_callback(c):
     """Wrap a user callback so the optimizer can always invoke it as `c(state)`.
 
     Old-style 3-arg callbacks `c(iteration, error, embedding)` are still
-    accepted but emit a FutureWarning at registration time.
+    accepted but emit a FutureWarning at registration time. A callback that
+    has at least three positional parameters and can be called with three
+    arguments is treated as old-style, since that is how it was called before
+    `IterationState` existed; one that can be called with a single argument
+    is new-style.
     """
     try:
         sig = inspect.signature(c)
@@ -126,20 +130,24 @@ def _adapt_callback(c):
         # Builtins or C-extensions without introspectable signatures: assume new style.
         return c
 
-    required = [
+    positional = [
         p for p in sig.parameters.values()
         if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
                       inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        and p.default is inspect.Parameter.empty
     ]
-    n_required = len(required)
+    n_positional = len(positional)
+    n_required = sum(p.default is inspect.Parameter.empty for p in positional)
     accepts_var_positional = any(
         p.kind is inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
     )
 
-    if n_required == 1 or (n_required == 0 and accepts_var_positional):
+    if n_required <= 1 and (n_positional in (1, 2) or (
+        n_positional == 0 and accepts_var_positional
+    )):
         return c
-    if n_required == 3:
+    if n_required <= 3 <= n_positional or (
+        2 <= n_required <= 3 and accepts_var_positional
+    ):
         warnings.warn(
             "Callbacks taking (iteration, error, embedding) are deprecated and "
             "will be removed in a future release. Switch to a single-argument "

@@ -849,6 +849,35 @@ class TestIterationStateCallback(unittest.TestCase):
             f"Expected FutureWarning, got: {[w.category for w in caught]}",
         )
 
+    def test_callback_style_detection(self):
+        from openTSNE.tsne import _adapt_callback
+
+        new_style = [
+            lambda state: None,
+            lambda state=None: None,
+            lambda state, extra=None: None,
+            lambda *args: None,
+        ]
+        old_style = [
+            lambda iteration, error, embedding: None,
+            lambda iteration, error, embedding=None: None,
+            lambda iteration, error=None, embedding=None: None,
+            lambda iteration, error, *args: None,
+        ]
+        invalid = [lambda: None, lambda a, b: None, lambda a, b, c, d: None]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FutureWarning)
+            for cb in new_style:
+                self.assertIs(_adapt_callback(cb), cb)
+        for cb in old_style:
+            with self.assertWarns(FutureWarning):
+                wrapped = _adapt_callback(cb)
+            self.assertIsNot(wrapped, cb)
+        for cb in invalid:
+            with self.assertRaises(TypeError):
+                _adapt_callback(cb)
+
     def test_optimization_about_to_start_fires_for_new_style_callback(self):
         # Class-based callback with the new IterationState signature.
         class MyCallback:
