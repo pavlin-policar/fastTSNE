@@ -60,9 +60,11 @@ class IterationState:
 
     embedding: TSNEEmbedding or PartialTSNEEmbedding
         A snapshot of the embedding at the current iteration. The embedding
-        carries its current ``dof_`` and ``optimization_iters_`` attributes;
-        retaining the snapshot after the callback returns is safe — it is a
-        copy, not the live optimizer state.
+        carries its current ``dof_`` and ``optimization_iters_`` attributes,
+        along with the affinities, parameters, and optimizer state, so it can
+        be optimized further or pickled. Retaining the snapshot after the
+        callback returns is safe — it is a copy, not the live optimizer state;
+        only the affinities are shared with the running optimization.
 
     gradient: np.ndarray
         The raw gradient produced by the objective function this iteration,
@@ -92,6 +94,24 @@ class IterationState:
     error: float
     dof: float
     dof_grad: float
+
+
+def _snapshot_embedding(embedding, dof, optimization_iters):
+    """Copy an embedding together with its metadata for a callback.
+
+    The copy can be retained, re-optimized, or pickled. Affinities and the
+    reference embedding are shared with the original; the optimizer state and
+    the parameter dict are copied, since the running optimization mutates them.
+    """
+    snapshot = embedding.copy()
+    snapshot.__dict__.update(getattr(embedding, "__dict__", {}))
+    if hasattr(embedding, "optimizer"):
+        snapshot.optimizer = embedding.optimizer.copy()
+    if hasattr(embedding, "gradient_descent_params"):
+        snapshot.gradient_descent_params = dict(embedding.gradient_descent_params)
+    snapshot.dof_ = dof
+    snapshot.optimization_iters_ = optimization_iters
+    return snapshot
 
 
 def _adapt_callback(c):
@@ -2415,7 +2435,7 @@ class gradient_descent:
 
             # Snapshot the raw gradient before any in-place modification so the
             # callback sees what the objective actually returned.
-            gradient_snapshot = gradient.copy() if should_call_callback else None
+            gradient_snapshot = np.array(gradient) if should_call_callback else None
 
             # Clip gradients to avoid points shooting off. This can be an issue
             # when applying transform and points are initialized so that the new
@@ -2429,13 +2449,12 @@ class gradient_descent:
                 error = error / exaggeration - np.log(exaggeration)
 
             if should_call_callback:
-                embedding_snapshot = embedding.copy()
-                embedding_snapshot.dof_ = dof_
-                embedding_snapshot.optimization_iters_ = initial_iter + iteration + 1
                 state = IterationState(
                     iteration=iteration + 1,
                     exaggeration=exaggeration,
-                    embedding=embedding_snapshot,
+                    embedding=_snapshot_embedding(
+                        embedding, dof_, initial_iter + iteration + 1
+                    ),
                     gradient=gradient_snapshot,
                     error=error,
                     dof=dof_,

@@ -783,6 +783,52 @@ class TestIterationStateCallback(unittest.TestCase):
         # And the snapshot arrays must not alias each other.
         self.assertIsNot(seen[0].embedding, seen[-1].embedding)
 
+    def test_retained_snapshot_keeps_embedding_metadata(self):
+        import pickle
+
+        seen = []
+        embedding = TSNE_BH(
+            dof=2.5,
+            early_exaggeration_iter=0,
+            n_iter=3,
+            callbacks=seen.append,
+            callbacks_every_iters=1,
+        ).fit(self.x)
+        snapshot = seen[0].embedding
+
+        self.assertIs(type(seen[0].gradient), np.ndarray)
+        self.assertIs(snapshot.affinities, embedding.affinities)
+        self.assertEqual(snapshot.gradient_descent_params["dof"], 2.5)
+        # The optimizer kept running after the snapshot, so its state must
+        # not be shared with the snapshot.
+        self.assertIsNot(snapshot.optimizer, embedding.optimizer)
+        self.assertFalse(
+            np.array_equal(
+                snapshot.optimizer.optimizers["embedding"].gains,
+                embedding.optimizer.optimizers["embedding"].gains,
+            )
+        )
+
+        loaded = pickle.loads(pickle.dumps(snapshot))
+        np.testing.assert_array_equal(loaded, snapshot)
+        self.assertEqual(loaded.dof_, 2.5)
+
+        resumed = snapshot.optimize(2)
+        self.assertEqual(resumed.optimization_iters_, 3)
+
+    def test_retained_partial_snapshot_can_be_optimized(self):
+        embedding = TSNE_BH(early_exaggeration_iter=0, n_iter=5).fit(self.x)
+        seen = []
+        partial_embedding = embedding.prepare_partial(self.x[::10])
+        partial_embedding.optimize(
+            2, callbacks=seen.append, callbacks_every_iters=1, inplace=True
+        )
+        snapshot = seen[0].embedding
+        self.assertIs(snapshot.reference_embedding, embedding)
+        self.assertIs(snapshot.P, partial_embedding.P)
+        resumed = snapshot.optimize(1)
+        self.assertTrue(np.all(np.isfinite(resumed)))
+
     def test_old_three_arg_callback_still_works_with_warning(self):
         calls = []
 
