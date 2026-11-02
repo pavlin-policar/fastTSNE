@@ -306,6 +306,67 @@ class TestKLDivergenceFFTReturnType(_ObjectiveFnMixin, unittest.TestCase):
         self.assertLess(rel_err, 1e-3, f"fft={fft:.10g}, exact={exact:.10g}")
 
 
+class TestCustomObjectiveFunction(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.x = datasets.load_iris()["data"]
+
+    def _embedding(self, **kwargs):
+        return TSNE_BH(early_exaggeration_iter=0, n_iter=0, **kwargs).fit(self.x)
+
+    def test_tuple_returning_objective_still_works_with_warning(self):
+        def objective(embedding, P, dof, bh_params, reference_embedding=None,
+                      should_eval_error=False, n_jobs=1, **_):
+            result = kl_divergence_bh(
+                embedding, P, dof, bh_params,
+                reference_embedding=reference_embedding,
+                should_eval_error=should_eval_error,
+                n_jobs=n_jobs,
+            )
+            return result.error, result.gradient
+
+        embedding = self._embedding()
+        with self.assertWarns(FutureWarning):
+            custom = embedding.optimize(5, negative_gradient_method=objective)
+        builtin = embedding.optimize(5, negative_gradient_method="bh")
+        np.testing.assert_allclose(custom, builtin)
+        self.assertAlmostEqual(custom.kl_divergence_, builtin.kl_divergence_)
+
+    def test_objective_without_compute_dof_grad_parameter(self):
+        calls = []
+
+        def objective(embedding, P, dof, bh_params, fft_params,
+                      reference_embedding, n_jobs, should_eval_error):
+            calls.append(dof)
+            return GradientResult(error=0.0, gradient=np.zeros_like(embedding))
+
+        self._embedding().optimize(2, negative_gradient_method=objective)
+        self.assertEqual(calls, [1, 1, 1])
+
+    def test_objective_receives_compute_dof_grad(self):
+        flags = []
+
+        def objective(embedding, P, compute_dof_grad=False, **kwargs):
+            flags.append(compute_dof_grad)
+            return kl_divergence_bh(
+                embedding, P, compute_dof_grad=compute_dof_grad, **kwargs
+            )
+
+        embedding = self._embedding(dof="auto")
+        optimized = embedding.optimize(2, negative_gradient_method=objective)
+        # Two iterations and a final error evaluation without the dof gradient
+        self.assertEqual(flags, [True, True, False])
+        self.assertNotEqual(optimized.dof_, 1.0)
+
+    def test_tuple_returning_objective_rejected_with_auto_dof(self):
+        def objective(embedding, P, **_):
+            return 0.0, np.zeros_like(embedding)
+
+        embedding = self._embedding(dof="auto")
+        with self.assertRaisesRegex(ValueError, "GradientResult"):
+            embedding.optimize(1, negative_gradient_method=objective)
+
+
 class TestOptimizerReturnShape(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
