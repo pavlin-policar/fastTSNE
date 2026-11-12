@@ -316,6 +316,49 @@ class TestSklearn(KNNIndexTestMixin, unittest.TestCase):
             check_mock_called_with_kwargs(mock, params)
 
 
+@unittest.skipIf(not is_package_installed("mlxvs"), "`mlxvs` is not installed")
+class TestMLXVS(KNNIndexTestMixin, unittest.TestCase):
+    knn_index = nearest_neighbors.MLXVS
+
+    def test_approximate_neighbors_and_query(self):
+        """Above `exact_below` points, the NN-Descent graph and the graph search
+        find nearly all of the exact neighbors."""
+        x = np.random.RandomState(0).normal(size=(5000, 10))
+        exact = nearest_neighbors.Sklearn(x, 15)
+        exact_build, _ = exact.build()
+        exact_query, _ = exact.query(x[:500], 15)
+        for metric in ["euclidean", "cosine"]:
+            knn_index = nearest_neighbors.MLXVS(
+                x, 15, metric=metric, knn_kwargs={"exact_below": 1000}
+            )
+            if metric == "cosine":
+                exact = nearest_neighbors.Sklearn(x, 15, metric="cosine")
+                exact_build, _ = exact.build()
+                exact_query, _ = exact.query(x[:500], 15)
+            indices, distances = knn_index.build()
+            self.assertEqual(indices.shape, (5000, 15))
+            self.assertFalse((indices == np.arange(5000)[:, None]).any())
+            recall = np.mean([len(set(a) & set(b)) / 15 for a, b in zip(indices, exact_build)])
+            self.assertGreater(recall, 0.95)
+            indices, distances = knn_index.query(x[:500], 15)
+            recall = np.mean([len(set(a) & set(b)) / 15 for a, b in zip(indices, exact_query)])
+            self.assertGreater(recall, 0.95)
+            self.assertTrue((np.diff(distances, axis=1) >= -1e-12).all())
+
+    def test_pickle_without_built_index(self):
+        knn_index = nearest_neighbors.MLXVS(self.iris, k=30)
+        self.assertIsNone(knn_index.index)
+
+        with tempfile.TemporaryDirectory() as dirname:
+            with open(path.join(dirname, "index.pkl"), "wb") as f:
+                pickle.dump(knn_index, f)
+
+            with open(path.join(dirname, "index.pkl"), "rb") as f:
+                loaded_obj = pickle.load(f)
+
+        self.assertIsNone(loaded_obj.index)
+
+
 @unittest.skipIf(not is_package_installed("hnswlib"), "`hnswlib`is not installed")
 class TestHNSW(KNNIndexTestMixin, unittest.TestCase):
     knn_index = nearest_neighbors.HNSW

@@ -1101,13 +1101,16 @@ class TSNE(BaseEstimator):
 
     neighbors: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
+        ``pynndescent``, ``hnsw``, ``mlxvs``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
         if the input data matrix is not a sparse object and if Annoy supports
         the given metric. Otherwise it uses Pynndescent. ``auto`` uses exact
         nearest neighbors for N<1000 and the same heuristic as ``approx`` for N>=1000.
         ``hnsw`` uses hnswlib, which must be installed separately
         (``pip install hnswlib``) and supports the ``euclidean``, ``l2``,
         ``cosine``, ``dot``, and ``ip`` metrics.
+        ``mlxvs`` runs on the GPU of Apple silicon Macs, needs mlxvs
+        (``pip install mlxvs``) and supports the ``euclidean``, ``l2`` and
+        ``cosine`` metrics.
 
     knn_kwargs: Optional[None, dict]
         Optional keyword arguments that will be passed to the ``knn_index``.

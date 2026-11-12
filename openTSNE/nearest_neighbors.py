@@ -792,6 +792,153 @@ class HNSW(KNNIndex):
         self.__dict__.update(state)
 
 
+class MLXVS(KNNIndex):
+    """Nearest neighbor search on the GPU of Apple silicon Macs, using mlxvs.
+
+    mlxvs (https://github.com/mikepapadim/mlxvs) runs on Apple's MLX and needs
+    macOS 14 or later on Apple silicon. Up to ``exact_below`` points (the
+    ``exact_below`` entry of ``knn_kwargs``, 50,000 by default) the neighbors
+    are exact: a matrix multiply and a top-k on the GPU, the same on every run.
+    Larger data sets get approximate neighbors from NN-Descent k-nearest
+    neighbor graphs, built in overlapping k-means clusters; these can differ
+    slightly between runs, even with a fixed ``random_state``. ``query`` then
+    searches a CAGRA graph index of the training data (``itopk_size`` entry of
+    ``knn_kwargs``: the search list length, 64 by default, longer is more
+    accurate). Distances are recomputed in double precision for the returned
+    neighbors: euclidean distances for ``euclidean`` and ``l2``, one minus the
+    cosine similarity for ``cosine``.
+
+    """
+    VALID_METRICS = [
+        "cosine",
+        "euclidean",
+        "l2",
+    ]
+
+    def __init__(self, *args, **kwargs):
+        try:
+            import mlxvs  # pylint: disable=unused-import,unused-variable
+        except ImportError:
+            raise ImportError(
+                "Please install mlxvs (macOS on Apple silicon only): "
+                "`pip install mlxvs`."
+            )
+        super().__init__(*args, **kwargs)
+
+    def _setting(self, name, default):
+        if self.knn_kwargs is not None and name in self.knn_kwargs:
+            return self.knn_kwargs[name]
+        return default
+
+    def _mlxvs_metric(self):
+        return "cosine" if self.metric == "cosine" else "l2"
+
+    def _exact(self):
+        return self.n_samples < self._setting("exact_below", 50_000)
+
+    def build(self):
+        import mlxvs
+
+        data, k = np.ascontiguousarray(self.data, dtype=np.float32), self.k
+
+        timer = utils.Timer(
+            f"Finding {k} nearest neighbors using mlxvs on the GPU "
+            f"({'exact' if self._exact() else 'approximate'} search) using "
+            f"{self.metric} distance...",
+            verbose=self.verbose,
+        )
+        timer.__enter__()
+
+        if self._exact():
+            indices, _ = mlxvs.brute_force_knn(
+                data, data, min(k + 1, self.n_samples), self._mlxvs_metric()
+            )
+            indices = np.asarray(indices).astype(np.int64)
+            indices = _exclude_self(indices, indices)[0]
+        else:
+            if self.random_state is not None:
+                warnings.warn(
+                    "mlxvs builds approximate nearest neighbor graphs of more "
+                    f"than {self._setting('exact_below', 50_000)} points with "
+                    "NN-Descent, which is not deterministic, so the nearest "
+                    "neighbors may differ slightly between runs even with a "
+                    "fixed `random_state`."
+                )
+            indices, _ = mlxvs.all_neighbors(data, k, self._mlxvs_metric())
+            indices = np.asarray(indices).astype(np.int64)
+
+        timer.__exit__()
+
+        return indices, self._distances(self.data, indices)
+
+    def query(self, query, k):
+        import mlxvs
+
+        timer = utils.Timer(
+            f"Finding {k} nearest neighbors in existing embedding using mlxvs "
+            f"on the GPU...",
+            self.verbose,
+        )
+        timer.__enter__()
+
+        query32 = np.ascontiguousarray(query, dtype=np.float32)
+        k_ = min(k, self.n_samples)
+        if self._exact():
+            indices, _ = mlxvs.brute_force_knn(
+                np.ascontiguousarray(self.data, dtype=np.float32),
+                query32,
+                k_,
+                self._mlxvs_metric(),
+            )
+        else:
+            if self.index is None:
+                self.index = mlxvs.CagraIndex.build(
+                    np.ascontiguousarray(self.data, dtype=np.float32),
+                    32,
+                    self._mlxvs_metric(),
+                )
+            indices, _ = self.index.search(
+                query32, k_, itopk_size=max(self._setting("itopk_size", 64), k_)
+            )
+        indices = np.asarray(indices).astype(np.int64)
+
+        timer.__exit__()
+
+        return indices, self._distances(query, indices)
+
+    def _distances(self, points, indices):
+        """The distances from each point to its neighbors, in double precision,
+        computed in blocks of points so that memory stays bounded."""
+        points = np.asarray(points)
+        data = np.asarray(self.data)
+        n, k = indices.shape
+        distances = np.empty((n, k), dtype=np.float64)
+        block = max(1, (64 << 20) // (8 * max(1, k * data.shape[1])))
+        for start in range(0, n, block):
+            rows = slice(start, min(n, start + block))
+            p = points[rows].astype(np.float64)
+            neighbors = data[indices[rows]].astype(np.float64)
+            if self.metric == "cosine":
+                dots = np.einsum("ij,ikj->ik", p, neighbors)
+                norms = np.linalg.norm(p, axis=1)[:, None] * np.linalg.norm(
+                    neighbors, axis=2
+                )
+                distances[rows] = 1 - dots / np.maximum(
+                    norms, np.finfo(np.float64).tiny
+                )
+            else:
+                distances[rows] = np.sqrt(
+                    ((neighbors - p[:, None, :]) ** 2).sum(axis=2)
+                )
+        return distances
+
+    def __getstate__(self):
+        # the GPU index is rebuilt on demand
+        state = dict(self.__dict__)
+        state["index"] = None
+        return state
+
+
 class PrecomputedDistanceMatrix(KNNIndex):
     """Use a precomputed distance matrix to construct the KNNG.
 
