@@ -96,7 +96,7 @@ class PerplexityBasedNN(Affinities):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx``
+        ``pynndescent``, ``hnsw``, ``mlxvs``, ``approx``, or ``auto`` (default). ``approx``
         uses Annoy if the input data matrix is not a sparse object and if Annoy
         supports the given metric. Otherwise, it uses Pynndescent. ``auto`` uses
         exact nearest neighbors for N<1000 and the same heuristic as ``approx``
@@ -104,6 +104,9 @@ class PerplexityBasedNN(Affinities):
         ``hnsw`` uses hnswlib, which must be installed separately
         (``pip install hnswlib``) and supports the ``euclidean``, ``l2``,
         ``cosine``, ``dot``, and ``ip`` metrics.
+        ``mlxvs`` runs on the GPU of Apple silicon Macs, needs mlxvs
+        (``pip install mlxvs``) and supports the ``euclidean``, ``l2`` and
+        ``cosine`` metrics.
 
     metric: Union[str, Callable]
         The metric to be used to compute affinities between points in the
@@ -408,7 +411,7 @@ class GammaSmoothedPerplexityNN(PerplexityBasedNN):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx``
+        ``pynndescent``, ``hnsw``, ``mlxvs``, ``approx``, or ``auto`` (default). ``approx``
         uses Annoy if the input data matrix is not a sparse object and if Annoy
         supports the given metric. Otherwise, it uses Pynndescent. ``auto`` uses
         exact nearest neighbors for N<1000 and the same heuristic as ``approx``
@@ -575,7 +578,8 @@ def get_knn_index(
         "approx": preferred_approx_method,
         "annoy": nearest_neighbors.Annoy,
         "pynndescent": nearest_neighbors.NNDescent,
-        "hnsw": nearest_neighbors.HNSW
+        "hnsw": nearest_neighbors.HNSW,
+        "mlxvs": nearest_neighbors.MLXVS,
     }
     if isinstance(method, nearest_neighbors.KNNIndex):
         knn_index = method
@@ -709,7 +713,7 @@ class FixedSigmaNN(Affinities):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx``
+        ``pynndescent``, ``hnsw``, ``mlxvs``, ``approx``, or ``auto`` (default). ``approx``
         uses Annoy if the input data matrix is not a sparse object and if Annoy
         supports the given metric. Otherwise, it uses Pynndescent. ``auto`` uses
         exact nearest neighbors for N<1000 and the same heuristic as ``approx``
@@ -717,6 +721,9 @@ class FixedSigmaNN(Affinities):
         ``hnsw`` uses hnswlib, which must be installed separately
         (``pip install hnswlib``) and supports the ``euclidean``, ``l2``,
         ``cosine``, ``dot``, and ``ip`` metrics.
+        ``mlxvs`` runs on the GPU of Apple silicon Macs, needs mlxvs
+        (``pip install mlxvs``) and supports the ``euclidean``, ``l2`` and
+        ``cosine`` metrics.
 
     metric: Union[str, Callable]
         The metric to be used to compute affinities between points in the
@@ -936,7 +943,7 @@ class MultiscaleMixture(Affinities):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx``
+        ``pynndescent``, ``hnsw``, ``mlxvs``, ``approx``, or ``auto`` (default). ``approx``
         uses Annoy if the input data matrix is not a sparse object and if Annoy
         supports the given metric. Otherwise, it uses Pynndescent. ``auto`` uses
         exact nearest neighbors for N<1000 and the same heuristic as ``approx``
@@ -944,6 +951,9 @@ class MultiscaleMixture(Affinities):
         ``hnsw`` uses hnswlib, which must be installed separately
         (``pip install hnswlib``) and supports the ``euclidean``, ``l2``,
         ``cosine``, ``dot``, and ``ip`` metrics.
+        ``mlxvs`` runs on the GPU of Apple silicon Macs, needs mlxvs
+        (``pip install mlxvs``) and supports the ``euclidean``, ``l2`` and
+        ``cosine`` metrics.
 
     metric: Union[str, Callable]
         The metric to be used to compute affinities between points in the
@@ -1244,7 +1254,7 @@ class Multiscale(MultiscaleMixture):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx``
+        ``pynndescent``, ``hnsw``, ``mlxvs``, ``approx``, or ``auto`` (default). ``approx``
         uses Annoy if the input data matrix is not a sparse object and if Annoy
         supports the given metric. Otherwise, it uses Pynndescent. ``auto`` uses
         exact nearest neighbors for N<1000 and the same heuristic as ``approx``
@@ -1252,6 +1262,9 @@ class Multiscale(MultiscaleMixture):
         ``hnsw`` uses hnswlib, which must be installed separately
         (``pip install hnswlib``) and supports the ``euclidean``, ``l2``,
         ``cosine``, ``dot``, and ``ip`` metrics.
+        ``mlxvs`` runs on the GPU of Apple silicon Macs, needs mlxvs
+        (``pip install mlxvs``) and supports the ``euclidean``, ``l2`` and
+        ``cosine`` metrics.
 
     metric: Union[str, Callable]
         The metric to be used to compute affinities between points in the
@@ -1333,7 +1346,7 @@ class Uniform(Affinities):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx``
+        ``pynndescent``, ``hnsw``, ``mlxvs``, ``approx``, or ``auto`` (default). ``approx``
         uses Annoy if the input data matrix is not a sparse object and if Annoy
         supports the given metric. Otherwise, it uses Pynndescent. ``auto`` uses
         exact nearest neighbors for N<1000 and the same heuristic as ``approx``
@@ -1341,6 +1354,9 @@ class Uniform(Affinities):
         ``hnsw`` uses hnswlib, which must be installed separately
         (``pip install hnswlib``) and supports the ``euclidean``, ``l2``,
         ``cosine``, ``dot``, and ``ip`` metrics.
+        ``mlxvs`` runs on the GPU of Apple silicon Macs, needs mlxvs
+        (``pip install mlxvs``) and supports the ``euclidean``, ``l2`` and
+        ``cosine`` metrics.
 
     metric: Union[str, Callable]
         The metric to be used to compute affinities between points in the
